@@ -2,6 +2,7 @@ import type { DbExecutor } from "@/db/client";
 import { CSRF_COOKIE, SESSION_COOKIE } from "@/modules/auth/config";
 import { hashSessionToken } from "@/modules/auth/crypto";
 import { findSessionByTokenHash } from "@/modules/auth/session-store";
+import { effectiveRoles } from "@/modules/auth/owner";
 
 /**
  * Read-only session resolution for Server Components.
@@ -40,6 +41,8 @@ export interface PageSessionLookupInput {
   db: DbExecutor;
   sessionSecret: string;
   now: Date;
+  /** Configured primary owner, or null/undefined when ownership is not set. */
+  ownerDiscordId?: string | null;
 }
 
 /**
@@ -71,7 +74,7 @@ export async function lookupPageSession(
       username: row.username,
       avatarUrl: row.avatar_url,
     },
-    roles: row.roles ?? [],
+    roles: effectiveRoles(row.roles, row.discord_id, input.ownerDiscordId),
     csrfToken: input.csrfToken,
     expiresAt: row.expires_at.toISOString(),
   };

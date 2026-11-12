@@ -1,5 +1,11 @@
-﻿import { afterEach, describe, expect, it } from "vitest";
-import { getDatabaseUrl, getRateLimitSecret, loadEnv, resetEnvCache } from "@/core/env";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  getDatabaseUrl,
+  getDiscordOwnerId,
+  getRateLimitSecret,
+  loadEnv,
+  resetEnvCache,
+} from "@/core/env";
 
 afterEach(() => {
   resetEnvCache();
@@ -62,5 +68,35 @@ describe("environment loader", () => {
       loadEnv({ MIDTRANS_IS_PRODUCTION: "true" } as unknown as NodeJS.ProcessEnv)
         .MIDTRANS_IS_PRODUCTION,
     ).toBe(true);
+  });
+
+  it("parses a valid Discord owner snowflake", () => {
+    const source = { DISCORD_OWNER_ID: "123456789012345678" } as unknown as NodeJS.ProcessEnv;
+    expect(getDiscordOwnerId(source)).toBe("123456789012345678");
+    expect(
+      loadEnv({ DISCORD_OWNER_ID: " 123456789012345678 " } as unknown as NodeJS.ProcessEnv),
+    ).toMatchObject({ DISCORD_OWNER_ID: "123456789012345678" });
+  });
+
+  it("treats an absent or empty Discord owner as not configured", () => {
+    expect(getDiscordOwnerId({} as unknown as NodeJS.ProcessEnv)).toBeNull();
+    expect(getDiscordOwnerId({ DISCORD_OWNER_ID: "" } as unknown as NodeJS.ProcessEnv)).toBeNull();
+    expect(
+      getDiscordOwnerId({ DISCORD_OWNER_ID: "   " } as unknown as NodeJS.ProcessEnv),
+    ).toBeNull();
+  });
+
+  it("rejects a malformed Discord owner id", () => {
+    for (const value of [
+      "not-a-snowflake",
+      "123",
+      "123456789012345678x",
+      "123456789012345678901",
+    ]) {
+      resetEnvCache();
+      expect(() => loadEnv({ DISCORD_OWNER_ID: value } as unknown as NodeJS.ProcessEnv)).toThrow(
+        /DISCORD_OWNER_ID must be a Discord snowflake/,
+      );
+    }
   });
 });

@@ -1,7 +1,7 @@
 import { cookies } from "next/headers";
 import { cache } from "react";
 
-import { getSessionSecret } from "@/core/env";
+import { getDiscordOwnerId, getSessionSecret } from "@/core/env";
 import { getSqlDb } from "@/db/client";
 import { SESSION_COOKIE } from "@/modules/auth/config";
 import { readPageSession } from "@/modules/auth/page-session";
@@ -22,5 +22,6 @@ export const getPageSession = cache(async () => {
     db: getSqlDb(),
     sessionSecret: getSessionSecret(),
     now: new Date(),
+    ownerDiscordId: getDiscordOwnerId(),
   });
 });

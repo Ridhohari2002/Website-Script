@@ -1,4 +1,4 @@
-import { loadEnv, getSessionSecret, secureCookiesEnabled } from "@/core/env";
+import { loadEnv, getDiscordOwnerId, getSessionSecret, secureCookiesEnabled } from "@/core/env";
 import { logger as rootLogger, type Logger } from "@/core/logger";
 import { clientIp, userAgent } from "@/core/request-meta";
 import type { Db } from "@/db/client";
@@ -28,6 +28,7 @@ import {
 import { AuthError, type AuthErrorCode } from "@/modules/auth/errors";
 import { writeAuditLog } from "@/modules/auth/audit";
 import { describeUserAgent } from "@/modules/auth/device";
+import { effectiveRoles } from "@/modules/auth/owner";
 import { consumeOAuthState, createOAuthState } from "@/modules/auth/oauth-state-store";
 import { absoluteRedirect, safeRedirectPath } from "@/modules/auth/redirect";
 import {
@@ -76,6 +77,8 @@ export interface AuthServiceDeps {
   logger?: Logger;
   sessionSecret?: string;
   secureCookies?: boolean;
+  /** Omitted reads `DISCORD_OWNER_ID`; null explicitly disables owner derivation. */
+  ownerDiscordId?: string | null;
   lifetimes?: Partial<SessionLifetimes>;
 }
 
@@ -160,6 +163,8 @@ export function createAuthService(deps: AuthServiceDeps = {}): AuthService {
   const db = (): Db => deps.db ?? getSqlDb();
   const clock = (): Date => (deps.clock ? deps.clock() : new Date());
   const secret = (): string => deps.sessionSecret ?? getSessionSecret();
+  const ownerId = (): string | null =>
+    deps.ownerDiscordId === undefined ? getDiscordOwnerId() : deps.ownerDiscordId;
   const secure = (): boolean => deps.secureCookies ?? secureCookiesEnabled();
   const appUrl = (): string => (deps.config ? deps.config.appUrl : loadEnv().APP_URL);
 
@@ -432,7 +437,7 @@ export function createAuthService(deps: AuthServiceDeps = {}): AuthService {
 
       return {
         userId: row.user_id,
-        roles: row.roles ?? [],
+        roles: effectiveRoles(row.roles, row.discord_id, ownerId()),
         sessionId: row.id,
         csrfToken: requestCsrfToken,
         user: {

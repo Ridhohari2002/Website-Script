@@ -39,6 +39,7 @@ cp .env.example .env.local
 | `DISCORD_CLIENT_ID` | For login | Discord application id (snowflake). Any placeholder works for tests; real login needs the real id. |
 | `DISCORD_CLIENT_SECRET` | For login | Server-only. Never commit it, log it, or expose it to browser code. |
 | `DISCORD_REDIRECT_URI` | For login | Must exactly equal `${APP_URL}/api/auth/callback`. |
+| `DISCORD_OWNER_ID` | No | Primary owner's Discord user id (snowflake). When set, the server appends the `owner` role to that user's effective roles. Leave empty to disable. |
 | `LOG_LEVEL` | No | `debug`, `info`, `warn`, `error`. Defaults to `info`. |
 | `APP_URL` | No | Defaults to `http://localhost:3000`. |
 | `MIDTRANS_SERVER_KEY` | Sandbox only | Server-only. Never commit it, never expose it to browser code. |
@@ -167,6 +168,27 @@ session leaves the caller signed in.
 - A handler that clears `bf_session` suppresses pending rotation cookies, so a
   response cannot re-add a live-looking session cookie after logout or
   self-revocation.
+
+### Primary owner
+
+`DISCORD_OWNER_ID` is optional. When it contains a valid Discord snowflake, every
+session resolution compares it with the `users.discord_id` stored for the
+authenticated account. On a match, the server appends `owner` to the effective
+roles for that request.
+
+- The id is read from server environment configuration only. Headers, cookies,
+  query parameters, and request bodies are never consulted.
+- The `owner` role is derived per request and is **not** written to `user_roles`.
+  The database check constraint therefore still allows only `user`, `moderator`,
+  and `admin`.
+- `owner` satisfies the existing admin route gate and every permission that
+  grants `admin`, through `hasAdminAccess` and `ADMIN_ROLES`. Regular users and
+  moderators receive no new capability.
+- An empty or absent value disables owner identification. A malformed value
+  makes environment parsing fail instead of silently granting nothing.
+- Changing the value takes effect after the server process restarts. Revoking
+  ownership needs no database cleanup and invalidates nothing else; the next
+  request simply stops deriving the role.
 
 ### CSRF contract
 

@@ -112,6 +112,108 @@ describe("authentication endpoints", () => {
     }
   });
 
+  it("reports owner only for the configured verified Discord id", async () => {
+    const owner = await createAuthHarness({ ownerDiscordId: "111122223333444455" });
+    const nonOwner = await createAuthHarness({ ownerDiscordId: "999988887777666655" });
+    try {
+      const ownerHandler = createHttpHarness(owner.service);
+      const ownerLogin = await performLogin(ownerHandler);
+      const ownerSession = await ownerHandler.call(
+        null,
+        new Request(`${BASE}/api/auth/session`, { headers: { cookie: ownerLogin.cookie } }),
+        ["auth", "session"],
+      );
+      expect(ownerSession.status).toBe(200);
+      expect((await ownerSession.json()).roles).toEqual(["user", "owner"]);
+
+      const nonOwnerHandler = createHttpHarness(nonOwner.service);
+      const nonOwnerLogin = await performLogin(nonOwnerHandler);
+      const nonOwnerSession = await nonOwnerHandler.call(
+        null,
+        new Request(`${BASE}/api/auth/session`, { headers: { cookie: nonOwnerLogin.cookie } }),
+        ["auth", "session"],
+      );
+      expect(nonOwnerSession.status).toBe(200);
+      expect((await nonOwnerSession.json()).roles).toEqual(["user"]);
+    } finally {
+      await owner.close();
+      await nonOwner.close();
+    }
+  });
+
+  it("ignores client-supplied Discord ids and role claims", async () => {
+    const harness = await createAuthHarness({ ownerDiscordId: "999988887777666655" });
+    try {
+      const handler = createHttpHarness(harness.service);
+      const { cookie } = await performLogin(handler);
+
+      const response = await handler.call(
+        null,
+        new Request(`${BASE}/api/auth/session`, {
+          headers: {
+            cookie,
+            "x-discord-id": "999988887777666655",
+            "x-user-id": "999988887777666655",
+            "x-role": "owner",
+            "x-roles": "owner,admin",
+          },
+        }),
+        ["auth", "session"],
+      );
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.user.discordId).toBe("111122223333444455");
+      expect(body.roles).toEqual(["user"]);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("lets owner through the admin route gate and still denies non-admins", async () => {
+    const owner = await createAuthHarness({ ownerDiscordId: "111122223333444455" });
+    const regular = await createAuthHarness();
+    try {
+      const ownerHandler = createHttpHarness(owner.service);
+      const ownerLogin = await performLogin(ownerHandler);
+      const ownerPing = await ownerHandler.call(
+        null,
+        new Request(`${BASE}/admin/ping`, { headers: { cookie: ownerLogin.cookie } }),
+        ["admin", "ping"],
+      );
+      expect(ownerPing.status).toBe(200);
+
+      const regularHandler = createHttpHarness(regular.service);
+      const regularLogin = await performLogin(regularHandler);
+      const regularPing = await regularHandler.call(
+        null,
+        new Request(`${BASE}/admin/ping`, { headers: { cookie: regularLogin.cookie } }),
+        ["admin", "ping"],
+      );
+      expect(regularPing.status).toBe(403);
+
+      const session = await regularHandler.call(
+        null,
+        new Request(`${BASE}/api/auth/session`, { headers: { cookie: regularLogin.cookie } }),
+        ["auth", "session"],
+      );
+      const userId = (await session.json()).user.id as string;
+
+      await regular.db.query(
+        "insert into user_roles (user_id, role, created_at) values ($1, 'admin', $2)",
+        [userId, regular.clock.now().toISOString()],
+      );
+      const adminPing = await regularHandler.call(
+        null,
+        new Request(`${BASE}/admin/ping`, { headers: { cookie: regularLogin.cookie } }),
+        ["admin", "ping"],
+      );
+      expect(adminPing.status).toBe(200);
+    } finally {
+      await owner.close();
+      await regular.close();
+    }
+  });
+
   it("requires a session for the session and logout endpoints", async () => {
     const harness = await createAuthHarness();
     try {

@@ -46,6 +46,7 @@ async function read(
     db: harness.db,
     sessionSecret: TEST_SESSION_SECRET,
     now,
+    ownerDiscordId: harness.ownerDiscordId,
   });
 }
 
@@ -97,6 +98,42 @@ describe("page session lookup", () => {
       ]);
     } finally {
       await harness.close();
+    }
+  });
+
+  it("derives the owner role from the verified Discord id", async () => {
+    const harness = await createAuthHarness({ ownerDiscordId: "111122223333444455" });
+    try {
+      const { token, userId } = await login(harness);
+      const session = await read(harness, { [SESSION_COOKIE]: token });
+
+      expect(session).not.toBeNull();
+      expect([...session!.roles].sort()).toEqual(["owner", "user"]);
+
+      const persisted = await harness.db.query<{ role: string }>(
+        "select role from user_roles where user_id = $1 and role = 'owner'",
+        [userId],
+      );
+      expect(persisted.rows).toHaveLength(0);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("does not derive owner for a different id or missing configuration", async () => {
+    const mismatched = await createAuthHarness({ ownerDiscordId: "999988887777666655" });
+    const unconfigured = await createAuthHarness();
+    try {
+      const first = await login(mismatched);
+      const firstSession = await read(mismatched, { [SESSION_COOKIE]: first.token });
+      expect(firstSession!.roles).toEqual(["user"]);
+
+      const second = await login(unconfigured);
+      const secondSession = await read(unconfigured, { [SESSION_COOKIE]: second.token });
+      expect(secondSession!.roles).toEqual(["user"]);
+    } finally {
+      await mismatched.close();
+      await unconfigured.close();
     }
   });
 

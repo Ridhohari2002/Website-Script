@@ -13,6 +13,7 @@ import { resolveRequestId } from "@/core/request-id";
 import { jsonResponse, responseClearsCookie } from "@/core/response";
 import { PostgresRateLimiter, type RateLimitDecision } from "@/db/rate-limit-store";
 import { SESSION_COOKIE } from "@/modules/auth/config";
+import { hasAdminAccess } from "@/modules/auth/permissions";
 import { assertCsrfToken, assertSameOrigin, allowedOrigins, isSafeMethod } from "@/middleware/csrf";
 import { anonymousSession, type SessionResolver } from "@/middleware/session";
 import { matchRoute, type RouteContext, type RouteDefinition } from "@/http/router";
@@ -87,7 +88,7 @@ export function createApiHandler(
 
       if (requiresSession) {
         if (!context.session) throw unauthorized("Authentication required");
-        if (match.route.access === "admin" && !context.session.roles.includes("admin")) {
+        if (match.route.access === "admin" && !hasAdminAccess(context.session.roles)) {
           if (dependencies.auditDenial) {
             try {
               await dependencies.auditDenial({

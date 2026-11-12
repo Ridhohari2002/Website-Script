@@ -40,6 +40,17 @@ const envSchema = z
     DISCORD_CLIENT_ID: optionalValue,
     DISCORD_CLIENT_SECRET: optionalValue,
     DISCORD_REDIRECT_URI: optionalValue,
+    // Primary owner. Optional so local builds and tests need no owner. When set,
+    // it must be a Discord snowflake and is compared only against the verified
+    // `users.discord_id` of a session; it is never accepted from a client.
+    DISCORD_OWNER_ID: z.preprocess(
+      (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+      z
+        .string()
+        .trim()
+        .regex(/^\d{17,20}$/, "DISCORD_OWNER_ID must be a Discord snowflake")
+        .optional(),
+    ),
     // Dedicated server key for hashing session tokens and OAuth state. Required
     // in production; a development-only default is used otherwise.
     SESSION_HMAC_SECRET: z.string().min(16).optional(),
@@ -87,6 +98,14 @@ export function getRateLimitSecret(source: NodeJS.ProcessEnv = process.env): str
   const env = loadEnv(source);
   if (env.RATE_LIMIT_HMAC_SECRET) return env.RATE_LIMIT_HMAC_SECRET;
   return "development-only-rate-limit-secret-change-me";
+}
+
+/**
+ * Returns the configured primary owner, or null when ownership is not set.
+ * An empty value means "not configured" rather than an invalid id.
+ */
+export function getDiscordOwnerId(source: NodeJS.ProcessEnv = process.env): string | null {
+  return loadEnv(source).DISCORD_OWNER_ID ?? null;
 }
 
 export function isProduction(source: NodeJS.ProcessEnv = process.env): boolean {

@@ -75,6 +75,7 @@ export interface AuthHarness extends TestDatabase {
   clock: FakeClock;
   service: AuthService;
   discord: MockDiscord;
+  ownerDiscordId: string | null;
 }
 
 export async function createAuthHarness(
@@ -84,12 +85,14 @@ export async function createAuthHarness(
     config?: DiscordOAuthConfig | null;
     secureCookies?: boolean;
     logger?: Logger;
+    ownerDiscordId?: string | null;
   } = {},
 ): Promise<AuthHarness> {
   const database = await createTestDatabase();
   const clock = options.clock ?? new FakeClock();
   const discord = options.discord ?? createMockDiscord();
   const config = options.config === undefined ? TEST_CONFIG : (options.config ?? undefined);
+  const ownerDiscordId = options.ownerDiscordId ?? null;
 
   const service = createAuthService({
     db: database.db,
@@ -99,9 +102,10 @@ export async function createAuthHarness(
     ...(options.logger ? { logger: options.logger } : {}),
     sessionSecret: TEST_SESSION_SECRET,
     secureCookies: options.secureCookies ?? false,
+    ownerDiscordId,
   });
 
-  return { ...database, clock, service, discord };
+  return { ...database, clock, service, discord, ownerDiscordId };
 }
 
 export interface ServiceLoginResult {

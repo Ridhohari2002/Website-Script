@@ -1,5 +1,5 @@
 import { forbidden, unauthorized } from "@/core/errors";
-import { hasPermission } from "@/modules/auth/permissions";
+import { hasAdminAccess, hasPermission } from "@/modules/auth/permissions";
 import type { SessionContext } from "@/middleware/session";
 
 /**
@@ -19,7 +19,9 @@ export function requireRole(
   allowedRoles: readonly string[],
 ): SessionContext {
   const resolved = requireUser(session);
-  if (!allowedRoles.some((role) => resolved.roles.includes(role))) {
+  const directMatch = allowedRoles.some((role) => resolved.roles.includes(role));
+  const ownerSatisfiesAdmin = allowedRoles.includes("admin") && hasAdminAccess(resolved.roles);
+  if (!directMatch && !ownerSatisfiesAdmin) {
     throw forbidden("Insufficient role");
   }
   return resolved;
