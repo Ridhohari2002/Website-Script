@@ -54,6 +54,9 @@ const envSchema = z
     // Dedicated server key for hashing session tokens and OAuth state. Required
     // in production; a development-only default is used otherwise.
     SESSION_HMAC_SECRET: z.string().min(16).optional(),
+    // D5 (owner-approved v1): server-only key for HMAC-SHA-256 of normalized
+    // HWIDs. Required in production; a development-only default is used otherwise.
+    HWID_HASH_SECRET: z.string().min(16).optional(),
   })
   .superRefine((value, ctx) => {
     if (value.NODE_ENV === "production" && !value.RATE_LIMIT_HMAC_SECRET) {
@@ -124,6 +127,20 @@ export function getSessionSecret(source: NodeJS.ProcessEnv = process.env): strin
     throw new Error("SESSION_HMAC_SECRET is required in production");
   }
   return "development-only-session-secret-change-me";
+}
+
+/**
+ * Server-only key for HWID HMAC-SHA-256 (D5 v1). Production must supply its
+ * own; development falls back to a clearly labelled default so local runs and
+ * the test suite need no secret.
+ */
+export function getHwidSecret(source: NodeJS.ProcessEnv = process.env): string {
+  const env = loadEnv(source);
+  if (env.HWID_HASH_SECRET) return env.HWID_HASH_SECRET;
+  if (env.NODE_ENV === "production") {
+    throw new Error("HWID_HASH_SECRET is required in production");
+  }
+  return "development-only-hwid-secret-change-me";
 }
 
 /** Cookies carry `Secure` on HTTPS origins and in production, never on http://localhost. */

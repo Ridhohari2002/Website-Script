@@ -5,6 +5,7 @@ import { createApiHandler } from "@/http/app";
 import type { RouteDefinition } from "@/http/router";
 import { CSRF_COOKIE, OAUTH_STATE_COOKIE, SESSION_COOKIE } from "@/modules/auth/config";
 import type { AuthService } from "@/modules/auth/service";
+import type { KeyService } from "@/modules/keys/service";
 import { createRoutes } from "@/routes";
 import { cookieValue } from "./auth";
 
@@ -16,9 +17,16 @@ const BROWSER_USER_AGENT =
 
 export type HttpHandler = ReturnType<typeof createHttpHarness>;
 
-export function createHttpHarness(service: AuthService, options: { denyRateLimit?: boolean } = {}) {
+export function createHttpHarness(
+  service: AuthService,
+  options: { denyRateLimit?: boolean; keys?: KeyService } = {},
+) {
   const routes: RouteDefinition[] = [
-    ...createRoutes({ auth: service, checkDatabase: async () => true }),
+    ...createRoutes({
+      auth: service,
+      checkDatabase: async () => true,
+      ...(options.keys ? { keys: options.keys } : {}),
+    }),
     {
       method: "GET",
       pattern: ["admin", "ping"],

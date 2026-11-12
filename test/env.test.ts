@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   getDatabaseUrl,
   getDiscordOwnerId,
+  getHwidSecret,
   getRateLimitSecret,
   loadEnv,
   resetEnvCache,
@@ -84,6 +85,21 @@ describe("environment loader", () => {
     expect(
       getDiscordOwnerId({ DISCORD_OWNER_ID: "   " } as unknown as NodeJS.ProcessEnv),
     ).toBeNull();
+  });
+
+  it("uses the development-only HWID secret outside production", () => {
+    const secret = getHwidSecret({} as unknown as NodeJS.ProcessEnv);
+    expect(secret).toMatch(/development-only/);
+  });
+
+  it("requires HWID_HASH_SECRET when used in production", () => {
+    resetEnvCache();
+    expect(() =>
+      getHwidSecret({
+        NODE_ENV: "production",
+        RATE_LIMIT_HMAC_SECRET: "a-sufficiently-long-secret-value",
+      } as unknown as NodeJS.ProcessEnv),
+    ).toThrow(/HWID_HASH_SECRET is required in production/);
   });
 
   it("rejects a malformed Discord owner id", () => {

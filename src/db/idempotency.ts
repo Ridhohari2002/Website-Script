@@ -1,8 +1,8 @@
-import type { PoolClient } from "pg";
 import { getRateLimitSecret } from "@/core/env";
 import { withPgTransaction } from "@/db/transaction";
 import { keyHash, requestHash } from "@/db/hashing";
 import { conflict, idempotencyConflict } from "@/core/errors";
+import type { DbExecutor } from "@/db/client";
 
 /**
  * D10 idempotency store.
@@ -20,14 +20,18 @@ export interface IdempotencyResult<T> {
   oneTimeSecret?: string;
 }
 
+export type IdempotencyTransaction = <T>(work: (executor: DbExecutor) => Promise<T>) => Promise<T>;
+
 export interface IdempotencyOptions<T> {
   scope: string;
   key: string;
   request: unknown;
   actorId?: string | null;
   ttlSeconds?: number;
+  /** Injected transaction runner (tests use the embedded database). */
+  transaction?: IdempotencyTransaction;
   /** Runs the protected mutation inside the same transaction as the claim. */
-  run: (client: PoolClient) => Promise<{ body: T; oneTimeSecret?: string }>;
+  run: (client: DbExecutor) => Promise<{ body: T; oneTimeSecret?: string }>;
 }
 
 interface KeyRow {
@@ -47,9 +51,10 @@ export async function withIdempotency<T>(
   const hashedKey = keyHash(options.key, secret);
   const hashedRequest = requestHash(options.request);
   const ttl = options.ttlSeconds ?? DEFAULT_TTL_SECONDS;
+  const transaction = options.transaction ?? defaultTransaction;
 
   try {
-    return await withPgTransaction(async (client) => {
+    return await transaction(async (client) => {
       const inserted = await client.query<{ id: string }>(
         `insert into idempotency_keys
            (scope, key_hash, request_hash, actor_id, status, expires_at)
@@ -101,3 +106,14 @@ export async function withIdempotency<T>(
     throw error;
   }
 }
+
+/** Production runner: one `pg` transaction wrapped as a minimal executor. */
+const defaultTransaction: IdempotencyTransaction = (work) =>
+  withPgTransaction(async (client) =>
+    work({
+      async query<T = Record<string, unknown>>(text: string, params?: readonly unknown[]) {
+        const result = await client.query(text, params ? [...params] : undefined);
+        return { rows: result.rows as T[], rowCount: result.rowCount };
+      },
+    }),
+  );
