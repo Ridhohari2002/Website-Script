@@ -1,0 +1,34 @@
+BOYFINITY Hub is a centralized catalog and access-control platform for game scripts. The intended shape is one account, one device-bound access key at a time, and a subscription or free-key offer that authorizes script access.
+
+The project is under active development. This page describes the platform as it exists in the repository today, not the finished product.
+
+## What exists today
+
+- A Next.js App Router application with the design system applied to public pages.
+- A public website: landing page, catalog shell, pricing shell, changelog, announcements, and this documentation.
+- A backend API entry point at `/api` with health checks, Discord OAuth, server-side sessions, role checks, CSRF protection, and rate limiting.
+- An initial PostgreSQL schema for users, sessions, roles, and audit records.
+- Discord sign-in in the public header and a minimal authenticated dashboard shell.
+
+## What is not available yet
+
+- No full account dashboard. Sign-in and a minimal account shell exist; key, subscription, and profile management do not.
+- No access keys. Key issuance, device binding, and validation are designed but not implemented.
+- No subscriptions or checkout. No payment provider is integrated, and no plan is for sale.
+- No catalog data. No script listings have been published.
+- No admin interface.
+
+If a page shows an unavailable state or a sample label, that is deliberate. The public site does not claim functionality that has not shipped.
+
+## How the pieces fit
+
+| Layer | Responsibility |
+| --- | --- |
+| Public site | Explains the platform, publishes documentation, and hosts catalog and pricing surfaces. |
+| API | One entry point that validates requests, resolves sessions, enforces roles, and writes audit records. |
+| Database | Stores identities, sessions, catalog records, keys, and billing state. |
+
+<Callout>
+  Documentation follows the same rule as the rest of the site: only implemented
+  behavior is described as available.
+</Callout>

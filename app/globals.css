@@ -1,0 +1,105 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens mirrored from DESIGN.md (Version 1.1).
+ * These are the only palette, radius, and spacing values the app may use.
+ */
+@theme {
+  --color-bg-primary: #08090b;
+  --color-bg-secondary: #0d0f13;
+  --color-bg-surface: #111318;
+  --color-bg-elevated: #171a21;
+  --color-bg-hover: #191c23;
+  --color-bg-input: #0b0d11;
+
+  --color-purple-primary: #34264d;
+  --color-purple-hover: #443361;
+  --color-purple-active: #281d3b;
+  --color-purple-soft: #211a2d;
+  --color-purple-border: #51406e;
+  --color-purple-text: #c5b2e2;
+
+  --color-text-primary: #f1f1f3;
+  --color-text-secondary: #a1a4ae;
+  --color-text-muted: #858995;
+  --color-text-disabled: #555963;
+  --color-text-inverse: #ffffff;
+
+  --color-border-default: #252832;
+  --color-border-subtle: #1c1f26;
+  --color-border-strong: #363b47;
+  --color-border-focus: #78609a;
+
+  --color-success: #4caf87;
+  --color-warning: #d9a441;
+  --color-danger: #d65c68;
+  --color-info: #6e9dd1;
+
+  --radius-xs: 3px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background-color: var(--color-purple-primary);
+  color: var(--color-text-inverse);
+}
+
+/* One visible focus treatment for every interactive surface. */
+:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 2px;
+}
+
+/* Shared page gutter: 1200px content width with the DESIGN.md spacing scale. */
+.shell {
+  margin-inline: auto;
+  width: 100%;
+  max-width: 1200px;
+  padding-inline: 20px;
+}
+
+@media (min-width: 640px) {
+  .shell {
+    padding-inline: 32px;
+  }
+}
+
+@media (min-width: 1024px) {
+  .shell {
+    padding-inline: 40px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

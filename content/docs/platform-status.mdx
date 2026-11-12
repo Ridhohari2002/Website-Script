@@ -1,0 +1,26 @@
+This page lists each surface and its real state. Status is updated by hand until an editorial workflow exists.
+
+| Surface | Status | Notes |
+| --- | --- | --- |
+| Public pages | In preview | Landing, catalog, pricing, changelog, announcements, and documentation render locally. |
+| Design system | In preview | Tokens and primitives are implemented; later surfaces must reuse them. |
+| Discord OAuth backend | In preview | Login, callback, and session routes are connected to the public header. |
+| Server sessions | In preview | Sessions are opaque, hashed, revocable, and read by protected server pages. |
+| Catalog | Not connected | No catalog API and no published listings. |
+| Access keys | Planned | Device binding, activation, and validation are not built. |
+| Subscriptions | Planned | No plan has been published. |
+| Payments | Not started | No provider integration and no checkout. |
+| Dashboard | In preview | Authenticated shell shows account status only; no keys, subscriptions, or history. |
+| Admin interface | Not started | Reserved for a later phase. |
+
+## Status meanings
+
+- **In preview**: present in this repository and usable in local development.
+- **Implemented, no interface**: server behavior exists but has no browser surface.
+- **Not connected**: a visual shell exists with no data source behind it.
+- **Planned**: specified, not implemented.
+- **Not started**: no implementation in this repository.
+
+## Reporting a mismatch
+
+If a page implies a capability that this table marks as planned or not started, treat the page as wrong. The status table is the source of truth.
