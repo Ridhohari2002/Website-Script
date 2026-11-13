@@ -13,56 +13,31 @@ import { executorActivateSchema, executorValidateSchema } from "@/validators/exe
  * `/api/executor/v1` endpoints. These routes are public by design: the license
  * key and executor session token are the credentials, and no Discord session is
  * involved. Authorization happens entirely in the executor service.
+ *
+ * Rate limiting is split by trust boundary:
+ * - The route applies an IP bucket before body parsing and before any database
+ *   work. `x-forwarded-for`/`x-real-ip` are trusted only behind the deployment's
+ *   reverse proxy; without that proxy they are client-controlled, which is why
+ *   the IP bucket is a coarse abuse guard, never an authorization decision.
+ * - Per-key and per-session buckets are applied inside the executor service,
+ *   after the key or session has been identified through its server-side HMAC
+ *   hash. Client headers such as `x-key-fingerprint` are ignored entirely.
  */
 
 const WINDOW_SECONDS = 60;
 const ACTIVATE_IP_LIMIT = 20;
-const ACTIVATE_FINGERPRINT_LIMIT = 5;
 const VALIDATE_IP_LIMIT = 240;
-const VALIDATE_TOKEN_LIMIT = 120;
 const REVOKE_IP_LIMIT = 60;
-const REVOKE_TOKEN_LIMIT = 10;
 
-/** Best-effort key fingerprint: the executor may send one for bucketing only. */
-const FINGERPRINT = /^[A-Za-z0-9_-]{4,128}$/;
-
-function dimensionsFor(
-  context: RouteContext,
-  limits: { ip: number; token: number; fingerprint?: number },
-): RateLimitDimension[] {
-  const dimensions: RateLimitDimension[] = [
+function ipDimension(context: RouteContext, limit: number): RateLimitDimension[] {
+  return [
     {
       kind: "ip",
       value: clientIp(context.request) ?? "unknown",
-      limit: limits.ip,
+      limit,
       windowSeconds: WINDOW_SECONDS,
     },
   ];
-
-  const authorization = context.request.headers.get("authorization");
-  const bearer = /^Bearer\s+(\S+)$/i.exec(authorization?.trim() ?? "")?.[1];
-  if (bearer) {
-    dimensions.push({
-      kind: "key",
-      value: bearer,
-      limit: limits.token,
-      windowSeconds: WINDOW_SECONDS,
-    });
-    return dimensions;
-  }
-
-  if (limits.fingerprint) {
-    const fingerprint = context.request.headers.get("x-key-fingerprint")?.trim();
-    if (fingerprint && FINGERPRINT.test(fingerprint)) {
-      dimensions.push({
-        kind: "key",
-        value: fingerprint,
-        limit: limits.fingerprint,
-        windowSeconds: WINDOW_SECONDS,
-      });
-    }
-  }
-  return dimensions;
 }
 
 const idSchema = z.string().uuid();
@@ -72,12 +47,7 @@ export function executorRoutes(service: ExecutorService): RouteDefinition[] {
     {
       method: "POST",
       pattern: ["executor", "v1", "activate"],
-      rateLimit: (context) =>
-        dimensionsFor(context, {
-          ip: ACTIVATE_IP_LIMIT,
-          token: ACTIVATE_FINGERPRINT_LIMIT,
-          fingerprint: ACTIVATE_FINGERPRINT_LIMIT,
-        }),
+      rateLimit: (context) => ipDimension(context, ACTIVATE_IP_LIMIT),
       async handler({ request, requestId }) {
         const body = validate(executorActivateSchema, await readJsonBody(request));
         const result = await service.activate({
@@ -97,8 +67,7 @@ export function executorRoutes(service: ExecutorService): RouteDefinition[] {
     {
       method: "POST",
       pattern: ["executor", "v1", "validate"],
-      rateLimit: (context) =>
-        dimensionsFor(context, { ip: VALIDATE_IP_LIMIT, token: VALIDATE_TOKEN_LIMIT }),
+      rateLimit: (context) => ipDimension(context, VALIDATE_IP_LIMIT),
       async handler({ request, requestId }) {
         const body = validate(executorValidateSchema, await readJsonBody(request));
         const token = bearerToken(request);
@@ -117,8 +86,7 @@ export function executorRoutes(service: ExecutorService): RouteDefinition[] {
     {
       method: "POST",
       pattern: ["executor", "v1", "session", "revoke"],
-      rateLimit: (context) =>
-        dimensionsFor(context, { ip: REVOKE_IP_LIMIT, token: REVOKE_TOKEN_LIMIT }),
+      rateLimit: (context) => ipDimension(context, REVOKE_IP_LIMIT),
       async handler({ request, requestId }) {
         // Revocation is authenticated by the bearer token alone; no body is
         // required and any body is ignored.

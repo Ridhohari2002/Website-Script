@@ -1,5 +1,10 @@
 import { badRequest, forbidden, notFound } from "@/core/errors";
-import { getHwidSecret, getKeySecretState, getSessionSecret } from "@/core/env";
+import {
+  getConfiguredKeySecret,
+  getHwidSecret,
+  getKeySecretState,
+  getSessionSecret,
+} from "@/core/env";
 import { HwidNormalizationError, hashHwid, hwidFingerprint } from "@/core/crypto/hwid";
 import { clientIp } from "@/core/request-meta";
 import type { Db, DbExecutor } from "@/db/client";
@@ -152,7 +157,25 @@ export interface KeyService {
   adminListKeys(input: AdminListKeysInput): Promise<Record<string, unknown>[]>;
   adminRevoke(input: AdminRevokeInput): Promise<Record<string, unknown>>;
   adminResetHwid(input: AdminResetHwidInput): Promise<Record<string, unknown>>;
+  /** Explicit, audited admin migration for an existing Discord-claimed key. */
+  adminAuthorizeExecutorClaim(
+    input: AdminAuthorizeExecutorClaimInput,
+  ): Promise<ExecutorClaimAuthorization>;
   adminDevices(session: SessionContext, keyId: string): Promise<Record<string, unknown>[]>;
+}
+
+export interface AdminAuthorizeExecutorClaimInput {
+  session: SessionContext;
+  request: Request;
+  keyId: string;
+  reason: string;
+}
+
+export interface ExecutorClaimAuthorization {
+  keyId: string;
+  authorizedAt: string;
+  alreadyAuthorized: boolean;
+  claimKind: "discord" | "executor" | null;
 }
 
 interface KeyRow {
@@ -179,6 +202,9 @@ interface KeyRow {
   claimed_at: Date | string | null;
   claim_kind: "executor" | "discord" | null;
   claim_ref: string | null;
+  executor_claim_authorized_at: Date | string | null;
+  executor_claim_authorized_by: string | null;
+  executor_claim_authorization_reason: string | null;
   key_hash_version: KeyHashVersion;
 }
 
@@ -278,20 +304,38 @@ export class PostgresKeyService implements KeyService {
 
   /**
    * Hash material used for new rows. Version 2 requires the dedicated secret;
-   * without it the service writes version 1 so Phase 4 hashes stay consistent.
+   * production refuses to load without it, and non-production writes version 1
+   * so Phase 4 hashes stay consistent.
    */
   private get keyHashState(): { secret: string; version: KeyHashVersion } {
     if (this.keySecretOverride) {
-      return {
-        secret: this.keySecretOverride,
-        version: this.keySecretVersionOverride ?? "v2",
-      };
+      const version = this.keySecretVersionOverride ?? "v2";
+      if (version !== "v2") {
+        throw new Error("A dedicated key secret must be used with hash version v2");
+      }
+      return { secret: this.keySecretOverride, version };
     }
     const configured = getKeySecretState();
     if (configured.version === "v1" && this.sessionSecretOverride) {
       return { secret: this.sessionSecretOverride, version: "v1" };
     }
     return configured;
+  }
+
+  /**
+   * Read-side material: the dedicated secret when configured, plus the legacy
+   * version 1 secret. Verification never depends on a writable secret, so a
+   * production deployment can still validate existing keys while an operator
+   * completes the configuration migration.
+   */
+  private configuredKeySecret(): { secret: string; version: KeyHashVersion } | null {
+    if (this.keySecretOverride) {
+      return {
+        secret: this.keySecretOverride,
+        version: this.keySecretVersionOverride ?? "v2",
+      };
+    }
+    return getConfiguredKeySecret();
   }
 
   private hashKey(plaintext: string): string {
@@ -301,11 +345,12 @@ export class PostgresKeyService implements KeyService {
 
   /** Reads try the configured version first, then the legacy version. */
   private keyHashCandidates(plaintext: string): string[] {
-    const state = this.keyHashState;
-    const candidates = [hashKeyValue(plaintext, state.secret, state.version)];
-    if (state.version !== "v1") {
-      candidates.push(hashKeyValue(plaintext, this.sessionSecret, "v1"));
+    const candidates: string[] = [];
+    const configured = this.configuredKeySecret();
+    if (configured) {
+      candidates.push(hashKeyValue(plaintext, configured.secret, configured.version));
     }
+    candidates.push(hashKeyValue(plaintext, this.sessionSecret, "v1"));
     return [...new Set(candidates)];
   }
 
@@ -315,14 +360,12 @@ export class PostgresKeyService implements KeyService {
   }
 
   private sessionTokenHashCandidates(token: string): string[] {
-    const state = this.keyHashState;
-    const candidates = [hashKeySessionToken(token, state.secret, state.version)];
-    if (state.version !== "v1") {
-      candidates.push(hashKeySessionToken(token, this.sessionSecret, "v1"));
+    const candidates: string[] = [];
+    const configured = this.configuredKeySecret();
+    if (configured) {
+      candidates.push(hashKeySessionToken(token, configured.secret, configured.version));
     }
-    if (this.keySecretOverride) {
-      candidates.push(hashKeySessionToken(token, this.keySecretOverride, "v2"));
-    }
+    candidates.push(hashKeySessionToken(token, this.sessionSecret, "v1"));
     return [...new Set(candidates)];
   }
 
@@ -1215,6 +1258,97 @@ export class PostgresKeyService implements KeyService {
       tx,
       actor,
       "key.hwid_reset_admin_failed",
+      keyId,
+      code,
+      reason,
+      request,
+    );
+  }
+
+  async adminAuthorizeExecutorClaim(
+    input: AdminAuthorizeExecutorClaimInput,
+  ): Promise<ExecutorClaimAuthorization> {
+    const actor = requireActor(input.session);
+    return this.persistDenial(() =>
+      this.db.transaction(async (tx) => {
+        const now = this.clock();
+        const found = await tx.query<KeyRow>("select * from keys where id = $1 for update", [
+          input.keyId,
+        ]);
+        const row = found.rows[0];
+        if (!row) throw notFound("Key not found");
+        if (row.status === "banned" || row.status === "revoked") {
+          return this.failExecutorClaim(
+            tx,
+            actor,
+            row.id,
+            terminalStatusDenial(row.status)!,
+            `status=${row.status}`,
+            input.request,
+          );
+        }
+        if (row.claim_kind === "executor") {
+          return {
+            keyId: row.id,
+            authorizedAt: iso(row.executor_claim_authorized_at) ?? now.toISOString(),
+            alreadyAuthorized: true,
+            claimKind: row.claim_kind,
+          };
+        }
+        const isLegacyClaim =
+          row.claim_kind === "discord" ||
+          row.claimed_at !== null ||
+          row.owner_discord_id !== null ||
+          row.activation_count > 0 ||
+          row.bound_hwid_hash !== null;
+        if (!isLegacyClaim) {
+          throw badRequest("Key has no legacy Discord claim to authorize");
+        }
+
+        const authorizedAt = iso(row.executor_claim_authorized_at) ?? now.toISOString();
+        await tx.query(
+          `update keys
+              set executor_claim_authorized_at = coalesce(executor_claim_authorized_at, $2),
+                  executor_claim_authorized_by = coalesce(executor_claim_authorized_by, $3),
+                  executor_claim_authorization_reason = coalesce(executor_claim_authorization_reason, $4),
+                  updated_at = $2
+            where id = $1`,
+          [row.id, authorizedAt, actor.userId, input.reason],
+        );
+        await this.audit(
+          tx,
+          actor.userId,
+          "key.executor_claim_authorize",
+          row.id,
+          {
+            reason: input.reason,
+            previousClaimKind: row.claim_kind,
+            alreadyAuthorized: row.executor_claim_authorized_at !== null,
+          },
+          input.request,
+        );
+        return {
+          keyId: row.id,
+          authorizedAt,
+          alreadyAuthorized: row.executor_claim_authorized_at !== null,
+          claimKind: row.claim_kind,
+        };
+      }),
+    );
+  }
+
+  private failExecutorClaim(
+    tx: DbExecutor,
+    actor: Actor,
+    keyId: string,
+    code: KeyDenialCode,
+    reason: string,
+    request: Request,
+  ): never {
+    return this.recordDenial(
+      tx,
+      actor,
+      "key.executor_claim_authorize_failed",
       keyId,
       code,
       reason,

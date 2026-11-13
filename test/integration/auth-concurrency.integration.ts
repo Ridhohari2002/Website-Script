@@ -6,7 +6,11 @@ import { MAX_ACTIVE_SESSIONS, OAUTH_STATE_COOKIE, SESSION_COOKIE } from "@/modul
 import { hashOAuthState } from "@/modules/auth/crypto";
 import { createAuthService } from "@/modules/auth/service";
 import type { DiscordOAuthClient } from "@/providers/discord/client";
-import { createPgTestDatabase, type PgTestDatabase } from "../helpers/pg-db";
+import {
+  CONCURRENCY_TEST_DATABASE_ENV,
+  createPgTestDatabase,
+  type PgTestDatabase,
+} from "../helpers/pg-db";
 
 /**
  * Real PostgreSQL concurrency test.
@@ -140,7 +144,9 @@ async function cleanup(db: Db, discordId: string, stateHashes: readonly string[]
   }
 }
 
-describe("real PostgreSQL session-cap concurrency", () => {
+const HAS_TEST_DATABASE = Boolean(process.env[CONCURRENCY_TEST_DATABASE_ENV]?.trim());
+
+describe.skipIf(!HAS_TEST_DATABASE)("real PostgreSQL session-cap concurrency", () => {
   it(
     "never exceeds five active sessions under concurrent completeLogin calls",
     { timeout: 60_000 },

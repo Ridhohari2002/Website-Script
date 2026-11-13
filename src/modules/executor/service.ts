@@ -1,10 +1,16 @@
-import { getHwidSecret, getKeySecretState, getSessionSecret } from "@/core/env";
+import {
+  getConfiguredKeySecret,
+  getHwidSecret,
+  getKeySecretState,
+  getSessionSecret,
+} from "@/core/env";
 import { clientIp, userAgent } from "@/core/request-meta";
-import { badRequest, notFound } from "@/core/errors";
+import { badRequest, notFound, rateLimited } from "@/core/errors";
 import { HwidNormalizationError, hashHwid, hwidFingerprint } from "@/core/crypto/hwid";
 import type { Db, DbExecutor } from "@/db/client";
 import { getSqlDb } from "@/db/client";
 import { constantTimeEqualHex } from "@/db/hashing";
+import { rateLimiter as defaultRateLimiter, type RateLimiter } from "@/db/rate-limit-store";
 import { resolveScriptAccess } from "@/modules/access/script-access";
 import { createOpaqueToken } from "@/modules/auth/crypto";
 import { writeKeyAuditLog, type KeyAuditAction } from "@/modules/keys/audit";
@@ -30,6 +36,20 @@ export const EXECUTOR_ABSOLUTE_MS = 24 * 60 * 60 * 1000;
 export const EXECUTOR_TIMESTAMP_TOLERANCE_MS = 5 * 60 * 1000;
 export const EXECUTOR_NONCE_TTL_MS = 10 * 60 * 1000;
 
+/**
+ * Server-side key/session limits run inside the service, after the key or
+ * session has been identified through a server-side hash lookup. The route-level
+ * IP limit still runs first, before the body is read.
+ *
+ * The bucket value is always a server-derived identifier (`keys.id` or
+ * `executor_sessions.id`), never a raw key, token, or client header. The rate
+ * limiter itself HMACs the value again before storage.
+ */
+const KEY_LIMIT_WINDOW_SECONDS = 60;
+const ACTIVATE_KEY_LIMIT = 5;
+const VALIDATE_SESSION_LIMIT = 120;
+const REVOKE_SESSION_LIMIT = 10;
+
 export interface ExecutorServiceDeps {
   db?: Db;
   clock?: () => Date;
@@ -37,6 +57,7 @@ export interface ExecutorServiceDeps {
   keySecret?: string;
   keySecretVersion?: KeyHashVersion;
   hwidSecret?: string;
+  limiter?: RateLimiter;
   idleMs?: number;
   absoluteMs?: number;
   timestampToleranceMs?: number;
@@ -96,6 +117,12 @@ export interface ExecutorRevokeResult {
   sessionId: string;
   revoked: boolean;
   alreadyRevoked: boolean;
+  /**
+   * Explicit outcome so a superseded session can never be reported as a fresh
+   * revocation, and the caller can tell the three terminal states apart.
+   */
+  outcome: "revoked" | "already_revoked" | "superseded" | "expired";
+  status: ExecutorSessionStatus;
 }
 
 export interface ExecutorSessionView {
@@ -128,11 +155,15 @@ export interface ExecutorService {
   }): Promise<ExecutorRevokeResult>;
 }
 
+type ExecutorSessionStatus = "active" | "superseded" | "expired" | "revoked";
+
 interface KeyRow {
   id: string;
   key_hash: string;
   key_hash_version: KeyHashVersion;
   status: "unused" | "active" | "expired" | "revoked" | "suspended" | "banned";
+  owner_discord_id: string | null;
+  user_id: string | null;
   bound_hwid_hash: string | null;
   activation_count: number;
   max_activations: number;
@@ -140,6 +171,7 @@ interface KeyRow {
   claimed_at: Date | string | null;
   claim_kind: "executor" | "discord" | null;
   claim_ref: string | null;
+  executor_claim_authorized_at: Date | string | null;
   product_id: string | null;
 }
 
@@ -150,7 +182,7 @@ interface SessionRow {
   session_token_hash_version: KeyHashVersion;
   hwid_hash: string;
   hwid_fingerprint: string;
-  status: "active" | "superseded" | "expired" | "revoked";
+  status: ExecutorSessionStatus;
   idle_expires_at: Date | string;
   absolute_expires_at: Date | string;
   last_seen_at: Date | string;
@@ -211,6 +243,7 @@ export class PostgresExecutorService implements ExecutorService {
   private readonly keySecretOverride: string | undefined;
   private readonly keySecretVersionOverride: KeyHashVersion | undefined;
   private readonly hwidSecretOverride: string | undefined;
+  private readonly limiter: RateLimiter;
   private readonly idleMs: number;
   private readonly absoluteMs: number;
   private readonly timestampToleranceMs: number;
@@ -223,6 +256,7 @@ export class PostgresExecutorService implements ExecutorService {
     this.keySecretOverride = deps.keySecret;
     this.keySecretVersionOverride = deps.keySecretVersion;
     this.hwidSecretOverride = deps.hwidSecret;
+    this.limiter = deps.limiter ?? defaultRateLimiter;
     this.idleMs = deps.idleMs ?? EXECUTOR_IDLE_MS;
     this.absoluteMs = deps.absoluteMs ?? EXECUTOR_ABSOLUTE_MS;
     this.timestampToleranceMs = deps.timestampToleranceMs ?? EXECUTOR_TIMESTAMP_TOLERANCE_MS;
@@ -241,29 +275,70 @@ export class PostgresExecutorService implements ExecutorService {
     if (this.keySecretOverride) {
       return { secret: this.keySecretOverride, version: this.keySecretVersionOverride ?? "v2" };
     }
-    const configured = getKeySecretState();
-    if (configured.version === "v1" && this.sessionSecretOverride) {
-      return { secret: this.sessionSecretOverride, version: "v1" };
+    return getKeySecretState();
+  }
+
+  /**
+   * Read-side material. Verification never depends on the write secret: a
+   * deployment can verify legacy version 1 keys with SESSION_HMAC_SECRET even
+   * after the dedicated secret is configured.
+   */
+  private configuredKeySecret(): { secret: string; version: KeyHashVersion } | null {
+    if (this.keySecretOverride) {
+      return {
+        secret: this.keySecretOverride,
+        version: this.keySecretVersionOverride ?? "v2",
+      };
     }
-    return configured;
+    return getConfiguredKeySecret();
   }
 
   private keyHashCandidates(plaintext: string): string[] {
-    const state = this.keyHashState;
-    const candidates = [hashKeyValue(plaintext, state.secret, state.version)];
-    if (state.version !== "v1") {
-      candidates.push(hashKeyValue(plaintext, this.sessionSecret, "v1"));
+    const candidates: string[] = [];
+    const configured = this.configuredKeySecret();
+    if (configured) {
+      candidates.push(hashKeyValue(plaintext, configured.secret, configured.version));
     }
+    candidates.push(hashKeyValue(plaintext, this.sessionSecret, "v1"));
     return [...new Set(candidates)];
   }
 
   private sessionTokenCandidates(token: string): string[] {
-    const state = this.keyHashState;
-    const candidates = [hashExecutorSessionToken(token, state.secret, state.version)];
-    if (state.version !== "v1") {
-      candidates.push(hashExecutorSessionToken(token, this.sessionSecret, "v1"));
+    const candidates: string[] = [];
+    const configured = this.configuredKeySecret();
+    if (configured) {
+      candidates.push(hashExecutorSessionToken(token, configured.secret, configured.version));
     }
+    candidates.push(hashExecutorSessionToken(token, this.sessionSecret, "v1"));
     return [...new Set(candidates)];
+  }
+
+  /**
+   * Consumes one key/session bucket. The value is the server-side row id, so a
+   * client cannot choose or rotate the bucket. Denial is generic and uses the
+   * same `rate_limited` surface as the route-level IP limit.
+   */
+  private async enforceLimit(kind: "key", value: string, limit: number): Promise<void> {
+    const decision = await this.limiter.consume([
+      { kind, value, limit, windowSeconds: KEY_LIMIT_WINDOW_SECONDS },
+    ]);
+    if (!decision.allowed) throw rateLimited();
+  }
+
+  private async keyIdForLimit(keyHashes: string[]): Promise<string | null> {
+    const found = await this.db.query<{ id: string }>(
+      "select id from keys where key_hash = any($1::text[])",
+      [keyHashes],
+    );
+    return found.rows[0]?.id ?? null;
+  }
+
+  private async sessionIdForLimit(tokenHashes: string[]): Promise<string | null> {
+    const found = await this.db.query<{ id: string }>(
+      "select id from executor_sessions where session_token_hash = any($1::text[])",
+      [tokenHashes],
+    );
+    return found.rows[0]?.id ?? null;
   }
 
   private async persistDenial<T>(work: () => Promise<T>): Promise<T> {
@@ -295,6 +370,13 @@ export class PostgresExecutorService implements ExecutorService {
   async activate(input: ExecutorActivateInput): Promise<ExecutorActivationBody> {
     const keyHashes = this.keyHashCandidates(input.key);
     const ip = clientIp(input.request);
+
+    // Identify the key through the server-side hash before spending the
+    // per-key bucket. Unknown keys are covered by the route IP limit and never
+    // create a key bucket, so a caller cannot probe key existence through timing
+    // or bucket names.
+    const limitedKeyId = await this.keyIdForLimit(keyHashes);
+    if (limitedKeyId) await this.enforceLimit("key", limitedKeyId, ACTIVATE_KEY_LIMIT);
 
     return this.persistDenial(() =>
       this.db.transaction(async (tx) => {
@@ -402,7 +484,45 @@ export class PostgresExecutorService implements ExecutorService {
           );
         }
 
-        const firstClaim = row.bound_hwid_hash === null;
+        /**
+         * Claim classification.
+         *
+         * A key claimed through the Phase 4 Discord flow is not a fresh executor
+         * claim merely because it has no HWID. It stays a Discord claim:
+         * - with a matching bound HWID it is a recovery/reactivation;
+         * - with no HWID it is ambiguous and must be authorized by an admin.
+         * Only a key with no claim evidence can enter the first-claim path.
+         */
+        const hasLegacyClaim =
+          row.claim_kind === "discord" ||
+          row.owner_discord_id !== null ||
+          row.claimed_at !== null ||
+          row.activation_count > 0;
+
+        let claimMode: "unclaimed" | "executor" | "legacy_authorized" | "legacy_recovery";
+        if (row.claim_kind === "executor") {
+          claimMode = "executor";
+        } else if (row.executor_claim_authorized_at !== null) {
+          claimMode = "legacy_authorized";
+        } else if (hasLegacyClaim) {
+          if (row.bound_hwid_hash && constantTimeEqualHex(hwidHash, row.bound_hwid_hash)) {
+            claimMode = "legacy_recovery";
+          } else {
+            return this.deny(
+              tx,
+              row.id,
+              "executor.activate_failed",
+              "already_owned",
+              "legacy Discord claim requires explicit admin authorization",
+              ip,
+            );
+          }
+        } else {
+          claimMode = "unclaimed";
+        }
+
+        const bindDevice = row.bound_hwid_hash === null;
+        const firstClaim = claimMode === "unclaimed";
         if (firstClaim && row.activation_count >= row.max_activations) {
           return this.deny(
             tx,
@@ -456,22 +576,28 @@ export class PostgresExecutorService implements ExecutorService {
         );
         const sessionId = inserted.rows[0]!.id;
 
+        // activation_count tracks first executor bindings only. Recoveries,
+        // reactivations, and admin-authorized legacy migrations never consume a
+        // new activation. Buyer identity columns are never written here.
         const activationCount = firstClaim ? row.activation_count + 1 : row.activation_count;
+        const claimKind = claimMode === "legacy_recovery" ? row.claim_kind : "executor";
         await tx.query(
           `update keys
               set status = 'active',
-                  bound_hwid_hash = coalesce($2, bound_hwid_hash),
-                  hwid_bound_at = case when $2 is null then hwid_bound_at else $3 end,
-                  claimed_at = coalesce(claimed_at, $3),
-                  claim_kind = coalesce(claim_kind, 'executor'),
-                  claim_ref = coalesce(claim_ref, $4),
-                  activation_count = $5,
-                  updated_at = $3
+                  bound_hwid_hash = case when $2 then $3 else bound_hwid_hash end,
+                  hwid_bound_at = case when $2 then $4 else hwid_bound_at end,
+                  claimed_at = case when $2 then coalesce(claimed_at, $4) else claimed_at end,
+                  claim_kind = $5,
+                  claim_ref = case when $2 then coalesce(claim_ref, $6) else claim_ref end,
+                  activation_count = $7,
+                  updated_at = $4
             where id = $1`,
           [
             row.id,
-            firstClaim ? hwidHash : null,
+            bindDevice,
+            hwidHash,
             now.toISOString(),
+            claimKind,
             input.executorName ? `executor:${input.executorName}`.slice(0, 120) : "executor",
             activationCount,
           ],
@@ -486,6 +612,7 @@ export class PostgresExecutorService implements ExecutorService {
           now,
           {
             sessionId,
+            claimMode,
             executorName: input.executorName ?? null,
             executorVersion: input.executorVersion ?? null,
             scriptId: access.script.publicId,
@@ -509,6 +636,7 @@ export class PostgresExecutorService implements ExecutorService {
             scriptId: access.script.publicId,
             productId: access.productId,
             firstClaim,
+            claimMode,
             reactivated: !firstClaim,
             replacedSession: superseded.rows[0]?.id ?? null,
           },
@@ -536,6 +664,13 @@ export class PostgresExecutorService implements ExecutorService {
   async validate(input: ExecutorValidateInput): Promise<ExecutorValidationBody> {
     const tokenHashes = this.sessionTokenCandidates(input.sessionToken);
     const ip = clientIp(input.request);
+
+    // Per-session budget, keyed by the server-side session id. The IP limit has
+    // already run in the route pipeline.
+    const limitedSessionId = await this.sessionIdForLimit(tokenHashes);
+    if (limitedSessionId) {
+      await this.enforceLimit("key", limitedSessionId, VALIDATE_SESSION_LIMIT);
+    }
 
     return this.persistDenial(() =>
       this.db.transaction(async (tx) => {
@@ -800,6 +935,11 @@ export class PostgresExecutorService implements ExecutorService {
     sessionToken: string;
   }): Promise<ExecutorRevokeResult> {
     const tokenHashes = this.sessionTokenCandidates(input.sessionToken);
+    const ip = clientIp(input.request);
+
+    const limitedSessionId = await this.sessionIdForLimit(tokenHashes);
+    if (limitedSessionId) await this.enforceLimit("key", limitedSessionId, REVOKE_SESSION_LIMIT);
+
     return this.persistDenial(() =>
       this.db.transaction(async (tx) => {
         const now = this.clock();
@@ -815,26 +955,65 @@ export class PostgresExecutorService implements ExecutorService {
             "executor.session_revoke_failed",
             "session_required",
             "unknown executor session",
-            clientIp(input.request),
+            ip,
           );
         }
 
-        if (session.status === "revoked") {
-          return { sessionId: session.id, revoked: false, alreadyRevoked: true };
+        // Only the calling session is ever touched. The key row, buyer identity,
+        // and every other session (active or not) are left untouched.
+        switch (session.status) {
+          case "revoked":
+            return {
+              sessionId: session.id,
+              revoked: false,
+              alreadyRevoked: true,
+              outcome: "already_revoked" as const,
+              status: session.status,
+            };
+          case "superseded":
+            return {
+              sessionId: session.id,
+              revoked: false,
+              alreadyRevoked: false,
+              outcome: "superseded" as const,
+              status: session.status,
+            };
+          case "expired":
+            return {
+              sessionId: session.id,
+              revoked: false,
+              alreadyRevoked: false,
+              outcome: "expired" as const,
+              status: session.status,
+            };
+          case "active":
+            break;
         }
 
-        await tx.query(
+        const updated = await tx.query(
           `update executor_sessions
             set status = 'revoked', revoked_at = $2
           where id = $1 and status = 'active'`,
           [session.id, now.toISOString()],
         );
+        if (updated.rowCount === 0) {
+          // A concurrent transition won; report the state honestly without
+          // writing a second revocation audit.
+          return {
+            sessionId: session.id,
+            revoked: false,
+            alreadyRevoked: true,
+            outcome: "already_revoked" as const,
+            status: "revoked" as const,
+          };
+        }
+
         await this.deviceEvent(
           tx,
           session.key_id,
           "executor_session_revoked",
           session.hwid_fingerprint,
-          clientIp(input.request),
+          ip,
           now,
           { sessionId: session.id, actor: "executor" },
         );
@@ -844,10 +1023,16 @@ export class PostgresExecutorService implements ExecutorService {
           actorRef: session.id,
           action: "executor.session_revoke",
           targetId: session.key_id,
-          metadata: { sessionId: session.id },
-          ip: clientIp(input.request),
+          metadata: { sessionId: session.id, outcome: "revoked" },
+          ip,
         });
-        return { sessionId: session.id, revoked: true, alreadyRevoked: false };
+        return {
+          sessionId: session.id,
+          revoked: true,
+          alreadyRevoked: false,
+          outcome: "revoked" as const,
+          status: "revoked" as const,
+        };
       }),
     );
   }
@@ -867,7 +1052,18 @@ export class PostgresExecutorService implements ExecutorService {
       const session = found.rows[0];
       if (!session) throw notFound("Session not found");
       if (session.status !== "active") {
-        return { sessionId: session.id, revoked: false, alreadyRevoked: true };
+        return {
+          sessionId: session.id,
+          revoked: false,
+          alreadyRevoked: session.status === "revoked",
+          outcome:
+            session.status === "revoked"
+              ? ("already_revoked" as const)
+              : session.status === "superseded"
+                ? ("superseded" as const)
+                : ("expired" as const),
+          status: session.status,
+        };
       }
       await tx.query(
         `update executor_sessions
@@ -890,10 +1086,16 @@ export class PostgresExecutorService implements ExecutorService {
         actorRef: session.id,
         action: "executor.session_revoke_admin",
         targetId: session.key_id,
-        metadata: { sessionId: session.id },
+        metadata: { sessionId: session.id, outcome: "revoked" },
         ip: clientIp(input.request),
       });
-      return { sessionId: session.id, revoked: true, alreadyRevoked: false };
+      return {
+        sessionId: session.id,
+        revoked: true,
+        alreadyRevoked: false,
+        outcome: "revoked" as const,
+        status: "revoked" as const,
+      };
     });
   }
 

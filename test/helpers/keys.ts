@@ -1,4 +1,6 @@
 import type { SessionContext } from "@/middleware/session";
+import type { Db } from "@/db/client";
+import type { RateLimitDecision, RateLimitDimension, RateLimiter } from "@/db/rate-limit-store";
 import type { TestDatabase } from "./db";
 import { createTestDatabase } from "./db";
 import { FakeClock } from "./auth";
@@ -8,6 +10,26 @@ import { createExecutorService, type ExecutorService } from "@/modules/executor/
 export const TEST_KEY_SESSION_SECRET = "test-key-session-secret-0123456789";
 export const TEST_HWID_SECRET = "test-hwid-secret-value-0123456789";
 export const TEST_KEY_SECRET = "test-dedicated-key-secret-0123456789";
+
+export interface TestRateLimiter extends RateLimiter {
+  calls: RateLimitDimension[][];
+  allowed: boolean;
+}
+
+/** In-memory limiter so unit tests never touch the production pool. */
+export function createTestRateLimiter(): TestRateLimiter {
+  const limiter: TestRateLimiter = {
+    calls: [],
+    allowed: true,
+    async consume(dimensions): Promise<RateLimitDecision> {
+      limiter.calls.push(dimensions);
+      return limiter.allowed
+        ? { allowed: true, retryAfterSeconds: 0 }
+        : { allowed: false, retryAfterSeconds: 30, exceeded: "key" };
+    },
+  };
+  return limiter;
+}
 
 export interface TestUser {
   userId: string;
@@ -20,6 +42,7 @@ export interface KeyHarness extends TestDatabase {
   clock: FakeClock;
   service: KeyService;
   executor: ExecutorService;
+  limiter: TestRateLimiter;
   owner: TestUser;
   other: TestUser;
 }
@@ -44,9 +67,12 @@ async function insertUser(
   };
 }
 
-export async function createKeyHarness(options: { clock?: FakeClock } = {}): Promise<KeyHarness> {
+export async function createKeyHarness(
+  options: { clock?: FakeClock; limiter?: TestRateLimiter } = {},
+): Promise<KeyHarness> {
   const database = await createTestDatabase();
   const clock = options.clock ?? new FakeClock();
+  const limiter = options.limiter ?? createTestRateLimiter();
   const owner = await insertUser(database.db, {
     discordId: "111122223333444455",
     username: "Owner",
@@ -65,11 +91,25 @@ export async function createKeyHarness(options: { clock?: FakeClock } = {}): Pro
     keySecret: TEST_KEY_SECRET,
     keySecretVersion: "v2" as const,
     hwidSecret: TEST_HWID_SECRET,
+    limiter,
   };
   const service = createKeyService(shared);
   const executor = createExecutorService(shared);
 
-  return { ...database, clock, service, executor, owner, other };
+  return { ...database, clock, service, executor, limiter, owner, other };
+}
+
+/**
+ * A Phase 4 style service that writes version 1 key hashes with the session
+ * secret. Used to prove legacy verification survives the v2 configuration.
+ */
+export function legacyKeyService(db: Db, clock: () => Date): KeyService {
+  return createKeyService({
+    db,
+    clock,
+    sessionSecret: TEST_KEY_SESSION_SECRET,
+    hwidSecret: TEST_HWID_SECRET,
+  });
 }
 
 export function sessionFor(user: TestUser, roles: string[] = user.roles): SessionContext {

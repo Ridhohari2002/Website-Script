@@ -18,6 +18,8 @@ export type KeyAuditAction =
   | "key.revoke"
   | "key.revoke_failed"
   | "key.ban_reactivation_consumed"
+  | "key.executor_claim_authorize"
+  | "key.executor_claim_authorize_failed"
   | "executor.activate"
   | "executor.activate_failed"
   | "executor.validate"

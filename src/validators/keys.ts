@@ -29,6 +29,13 @@ export const adminResetHwidSchema = z
   })
   .strict();
 
+/** Explicit operator migration of a legacy Discord-claimed key to executor. */
+export const adminAuthorizeExecutorClaimSchema = z
+  .object({
+    reason: z.string().trim().min(1).max(500),
+  })
+  .strict();
+
 export const adminRevokeSchema = z
   .object({
     reason: reason.optional(),

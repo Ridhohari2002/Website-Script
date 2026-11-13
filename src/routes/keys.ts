@@ -7,6 +7,7 @@ import type { RouteDefinition } from "@/http/router";
 import type { KeyService } from "@/modules/keys/service";
 import {
   activateSchema,
+  adminAuthorizeExecutorClaimSchema,
   adminGenerateSchema,
   adminListQuerySchema,
   adminResetHwidSchema,
@@ -190,6 +191,23 @@ export function keyRoutes(service: KeyService): RouteDefinition[] {
         const keyId = validate(keyIdSchema, params.id);
         const body = validate(adminResetHwidSchema, await readJsonBody(request));
         const result = await service.adminResetHwid({
+          session,
+          request,
+          keyId,
+          reason: body.reason,
+        });
+        return jsonResponse(result, { status: 200, requestId });
+      },
+    },
+    {
+      method: "POST",
+      pattern: ["admin", "keys", ":id", "executor-claim"],
+      access: "admin",
+      async handler({ session, params, request, requestId }) {
+        if (!session) throw new Error("session missing after access gate");
+        const keyId = validate(keyIdSchema, params.id);
+        const body = validate(adminAuthorizeExecutorClaimSchema, await readJsonBody(request));
+        const result = await service.adminAuthorizeExecutorClaim({
           session,
           request,
           keyId,

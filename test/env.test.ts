@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  getConfiguredKeySecret,
   getDatabaseUrl,
   getDiscordOwnerId,
   getHwidSecret,
@@ -44,8 +45,42 @@ describe("environment loader", () => {
     const env = loadEnv({
       NODE_ENV: "production",
       RATE_LIMIT_HMAC_SECRET: "a-sufficiently-long-secret-value",
+      KEY_HMAC_SECRET: "a-sufficiently-long-key-secret-value",
+      SESSION_HMAC_SECRET: "a-sufficiently-long-session-secret-value",
+      HWID_HASH_SECRET: "a-sufficiently-long-hwid-secret-value",
     } as unknown as NodeJS.ProcessEnv);
     expect(env.NODE_ENV).toBe("production");
+  });
+
+  it("requires KEY_HMAC_SECRET in production", () => {
+    resetEnvCache();
+    expect(() =>
+      loadEnv({
+        NODE_ENV: "production",
+        RATE_LIMIT_HMAC_SECRET: "a-sufficiently-long-secret-value",
+      } as unknown as NodeJS.ProcessEnv),
+    ).toThrow(/KEY_HMAC_SECRET is required in production/);
+  });
+
+  it("rejects KEY_HMAC_KEY_VERSION other than v2 when a dedicated secret is set", () => {
+    resetEnvCache();
+    expect(() =>
+      loadEnv({
+        KEY_HMAC_SECRET: "dedicated-key-secret-0123456789",
+        KEY_HMAC_KEY_VERSION: "v1",
+      } as unknown as NodeJS.ProcessEnv),
+    ).toThrow(/KEY_HMAC_KEY_VERSION must be v2/);
+  });
+
+  it("exposes no configured key secret when the deployment has not opted in", () => {
+    resetEnvCache();
+    expect(getConfiguredKeySecret({} as unknown as NodeJS.ProcessEnv)).toBeNull();
+    resetEnvCache();
+    expect(
+      getConfiguredKeySecret({
+        KEY_HMAC_SECRET: "dedicated-key-secret-0123456789",
+      } as unknown as NodeJS.ProcessEnv),
+    ).toEqual({ secret: "dedicated-key-secret-0123456789", version: "v2" });
   });
 
   it("requires a postgres URL when one is provided", () => {
@@ -116,6 +151,8 @@ describe("environment loader", () => {
       getHwidSecret({
         NODE_ENV: "production",
         RATE_LIMIT_HMAC_SECRET: "a-sufficiently-long-secret-value",
+        KEY_HMAC_SECRET: "a-sufficiently-long-key-secret-value",
+        SESSION_HMAC_SECRET: "a-sufficiently-long-session-secret-value",
       } as unknown as NodeJS.ProcessEnv),
     ).toThrow(/HWID_HASH_SECRET is required in production/);
   });

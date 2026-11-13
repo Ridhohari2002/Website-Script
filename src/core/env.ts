@@ -71,6 +71,23 @@ const envSchema = z
         message: "RATE_LIMIT_HMAC_SECRET is required in production",
       });
     }
+    // A missing dedicated key secret must never silently create version 1
+    // hashes from the session secret in production. Existing version 1 keys are
+    // still verified with SESSION_HMAC_SECRET once the new secret is set.
+    if (value.NODE_ENV === "production" && !value.KEY_HMAC_SECRET) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["KEY_HMAC_SECRET"],
+        message: "KEY_HMAC_SECRET is required in production",
+      });
+    }
+    if (value.KEY_HMAC_SECRET && value.KEY_HMAC_KEY_VERSION !== "v2") {
+      ctx.addIssue({
+        code: "custom",
+        path: ["KEY_HMAC_KEY_VERSION"],
+        message: "KEY_HMAC_KEY_VERSION must be v2 when KEY_HMAC_SECRET is set",
+      });
+    }
   });
 
 export type Env = z.infer<typeof envSchema>;
@@ -137,20 +154,39 @@ export function getSessionSecret(source: NodeJS.ProcessEnv = process.env): strin
 /**
  * Key-hashing material plus the version new hashes are written with.
  *
- * Version 2 uses the dedicated `KEY_HMAC_SECRET`. Without it the loader stays
- * on version 1 with `SESSION_HMAC_SECRET`; that keeps every Phase 4 hash
- * valid without storing or re-deriving plaintext keys. Reads always try both
- * versions, so a secret can be introduced later without a data migration.
+ * Version 2 uses the dedicated `KEY_HMAC_SECRET`; production refuses to load
+ * without it (see `superRefine`), so a deployment can never silently create new
+ * version 1 hashes from `SESSION_HMAC_SECRET`. Non-production keeps a version 1
+ * fallback so the test suite and local runs need no secret.
+ *
+ * This function is for writes. Reads must also verify legacy version 1 hashes
+ * through `getConfiguredKeySecret` plus `SESSION_HMAC_SECRET`; see the key and
+ * executor services.
  */
 export function getKeySecretState(source: NodeJS.ProcessEnv = process.env): {
   secret: string;
   version: "v1" | "v2";
 } {
-  const env = loadEnv(source);
-  if (env.KEY_HMAC_SECRET) {
-    return { secret: env.KEY_HMAC_SECRET, version: env.KEY_HMAC_KEY_VERSION };
-  }
+  const configured = getConfiguredKeySecret(source);
+  if (configured) return configured;
   return { secret: getSessionSecret(source), version: "v1" };
+}
+
+/**
+ * Dedicated key secret, or null when the deployment has not opted in.
+ *
+ * `KEY_HMAC_KEY_VERSION` is validated here as well as in the env schema so a
+ * caller that bypasses `loadEnv` caching still gets a clear, secret-free error.
+ */
+export function getConfiguredKeySecret(
+  source: NodeJS.ProcessEnv = process.env,
+): { secret: string; version: "v2" } | null {
+  const env = loadEnv(source);
+  if (!env.KEY_HMAC_SECRET) return null;
+  if (env.KEY_HMAC_KEY_VERSION !== "v2") {
+    throw new Error("KEY_HMAC_KEY_VERSION must be v2 when KEY_HMAC_SECRET is configured");
+  }
+  return { secret: env.KEY_HMAC_SECRET, version: "v2" };
 }
 
 /**
