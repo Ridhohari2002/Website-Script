@@ -74,13 +74,18 @@ export async function resolveScriptAccess(
   const script = scriptResult.rows[0];
   if (!script) return { ok: false, code: "script_not_found" };
 
+  // Share-lock the entitlement rows so a concurrent revocation or suspension
+  // cannot commit between this read and the grant. Every caller locks the key
+  // row first; this lock is only ever taken after that, so entitlement writes
+  // cannot invert the keys -> executor_sessions order.
   const entitlements = await db.query<EntitlementRow>(
     `select ke.id, ke.product_id, ke.status, ke.starts_at, ke.expires_at, p.active as product_active
        from key_entitlements ke
        join products p on p.id = ke.product_id
        join product_scripts ps on ps.product_id = ke.product_id and ps.script_id = $2
       where ke.key_id = $1
-      order by ke.created_at desc, ke.id desc`,
+      order by ke.created_at desc, ke.id desc
+      for share of ke`,
     [input.keyId, script.scriptId],
   );
 

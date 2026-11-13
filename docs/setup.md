@@ -317,11 +317,22 @@ Create the database once, using your local PostgreSQL role:
 createdb -h localhost -p 5432 -U postgres boyfinity_concurrency_test
 ```
 
-Provide the dedicated connection URL in the current shell. Use a password
-manager, `.pgpass`, or a CI secret; do not echo it or commit it:
+Or run an isolated official PostgreSQL container on a non-default port:
 
 ```powershell
-$env:BOYFINITY_CONCURRENCY_TEST_DATABASE_URL = Read-Host "Concurrency test database URL"
+docker run --name boyfinity-concurrency-test -e POSTGRES_PASSWORD=postgres -p 55432:5432 -d postgres:16-alpine
+docker exec boyfinity-concurrency-test createdb -U postgres boyfinity_concurrency_test
+$env:TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:55432/boyfinity_concurrency_test"
+```
+
+Stop and remove the container when finished with
+`docker rm -f boyfinity-concurrency-test`.
+
+Otherwise, provide the dedicated connection URL in the current shell. Use a
+password manager, `.pgpass`, or a CI secret; do not echo it or commit it:
+
+```powershell
+$env:TEST_DATABASE_URL = Read-Host "Concurrency test database URL"
 ```
 
 Apply the reviewed migration to that database only:
@@ -339,7 +350,7 @@ npm run test:integration:concurrency
 Remove the variable from the shell afterward:
 
 ```powershell
-Remove-Item Env:BOYFINITY_CONCURRENCY_TEST_DATABASE_URL
+Remove-Item Env:TEST_DATABASE_URL
 ```
 
 The test uses a dedicated `pg.Pool`, real `BEGIN` / `COMMIT` / `ROLLBACK`

@@ -1,13 +1,12 @@
 import { loadLocalEnv, runMigrations } from "./migration-runner";
 
 /**
- * Test-only migration runner. It reads only
- * BOYFINITY_CONCURRENCY_TEST_DATABASE_URL and refuses anything but the
- * dedicated concurrency database. It never falls back to DATABASE_URL and
- * never prints the connection string.
+ * Test-only migration runner. It reads only TEST_DATABASE_URL and refuses
+ * anything but the dedicated concurrency database. It never falls back to
+ * DATABASE_URL and never prints the connection string.
  */
 
-const ENV_NAME = "BOYFINITY_CONCURRENCY_TEST_DATABASE_URL";
+const ENV_NAME = "TEST_DATABASE_URL";
 const DATABASE_NAME = "boyfinity_concurrency_test";
 
 function requireTestDatabaseUrl(source: NodeJS.ProcessEnv = process.env): string {

@@ -5,11 +5,11 @@ import type { Db, DbExecutor, QueryResult } from "@/db/client";
  * Real-PostgreSQL adapter for the concurrency integration test.
  *
  * It deliberately does not use src/db/pool.ts or DATABASE_URL. The only
- * accepted connection string is BOYFINITY_CONCURRENCY_TEST_DATABASE_URL, and
- * the database name must be exactly `boyfinity_concurrency_test`.
+ * accepted connection string is TEST_DATABASE_URL, and the database name must
+ * be exactly `boyfinity_concurrency_test`.
  */
 
-export const CONCURRENCY_TEST_DATABASE_ENV = "BOYFINITY_CONCURRENCY_TEST_DATABASE_URL";
+export const CONCURRENCY_TEST_DATABASE_ENV = "TEST_DATABASE_URL";
 export const CONCURRENCY_TEST_DATABASE_NAME = "boyfinity_concurrency_test";
 
 const POOL_MAX = 12;

@@ -675,18 +675,54 @@ export class PostgresExecutorService implements ExecutorService {
     return this.persistDenial(() =>
       this.db.transaction(async (tx) => {
         const now = this.clock();
-        const sessionResult = await tx.query<SessionRow>(
-          "select * from executor_sessions where session_token_hash = any($1::text[]) for update",
+
+        // Lock order is always keys -> executor_sessions. The session is first
+        // identified without a lock only to learn its key; the key is then
+        // locked and the session is read again under its own lock. The unlocked
+        // lookup is never used for authorization.
+        const sessionLookup = await tx.query<{ id: string; key_id: string }>(
+          "select id, key_id from executor_sessions where session_token_hash = any($1::text[])",
           [tokenHashes],
         );
-        const session = sessionResult.rows[0];
-        if (!session) {
+        const sessionRef = sessionLookup.rows[0];
+        if (!sessionRef) {
           return this.deny(
             tx,
             null,
             "executor.validate_failed",
             "session_required",
             "unknown executor session",
+            ip,
+          );
+        }
+
+        const keyResult = await tx.query<KeyRow>("select * from keys where id = $1 for update", [
+          sessionRef.key_id,
+        ]);
+        const key = keyResult.rows[0];
+        if (!key) {
+          return this.deny(
+            tx,
+            sessionRef.key_id,
+            "executor.validate_failed",
+            "invalid_key",
+            "key missing",
+            ip,
+          );
+        }
+
+        const sessionResult = await tx.query<SessionRow>(
+          "select * from executor_sessions where id = $1 and key_id = $2 for update",
+          [sessionRef.id, key.id],
+        );
+        const session = sessionResult.rows[0];
+        if (!session) {
+          return this.deny(
+            tx,
+            key.id,
+            "executor.validate_failed",
+            "session_required",
+            "session missing after key lock",
             ip,
           );
         }
@@ -732,20 +768,6 @@ export class PostgresExecutorService implements ExecutorService {
           );
         }
 
-        const keyResult = await tx.query<KeyRow>("select * from keys where id = $1 for update", [
-          session.key_id,
-        ]);
-        const key = keyResult.rows[0];
-        if (!key) {
-          return this.deny(
-            tx,
-            session.key_id,
-            "executor.validate_failed",
-            "invalid_key",
-            "key missing",
-            ip,
-          );
-        }
         const terminal = terminalDenial(key.status);
         if (terminal) {
           return this.deny(
@@ -943,18 +965,54 @@ export class PostgresExecutorService implements ExecutorService {
     return this.persistDenial(() =>
       this.db.transaction(async (tx) => {
         const now = this.clock();
-        const found = await tx.query<SessionRow>(
-          "select * from executor_sessions where session_token_hash = any($1::text[]) for update",
+
+        // Lock order is always keys -> executor_sessions. Identify the session
+        // without a lock only to learn its key, then lock the key before the
+        // session row and re-read the session under that lock.
+        const sessionLookup = await tx.query<{ id: string; key_id: string }>(
+          "select id, key_id from executor_sessions where session_token_hash = any($1::text[])",
           [tokenHashes],
         );
-        const session = found.rows[0];
-        if (!session) {
+        const sessionRef = sessionLookup.rows[0];
+        if (!sessionRef) {
           return this.deny(
             tx,
             null,
             "executor.session_revoke_failed",
             "session_required",
             "unknown executor session",
+            ip,
+          );
+        }
+
+        const keyResult = await tx.query<{ id: string }>(
+          "select id from keys where id = $1 for update",
+          [sessionRef.key_id],
+        );
+        const key = keyResult.rows[0];
+        if (!key) {
+          return this.deny(
+            tx,
+            sessionRef.key_id,
+            "executor.session_revoke_failed",
+            "invalid_key",
+            "key missing",
+            ip,
+          );
+        }
+
+        const found = await tx.query<SessionRow>(
+          "select * from executor_sessions where id = $1 and key_id = $2 for update",
+          [sessionRef.id, key.id],
+        );
+        const session = found.rows[0];
+        if (!session) {
+          return this.deny(
+            tx,
+            key.id,
+            "executor.session_revoke_failed",
+            "session_required",
+            "session missing after key lock",
             ip,
           );
         }
@@ -1045,6 +1103,16 @@ export class PostgresExecutorService implements ExecutorService {
   }): Promise<ExecutorRevokeResult> {
     return this.db.transaction(async (tx) => {
       const now = this.clock();
+
+      // Same keys -> executor_sessions order as every other executor and key
+      // transaction. The key is locked even though only the session changes, so
+      // an admin revoke cannot interleave with activation or validation.
+      const keyResult = await tx.query<{ id: string }>(
+        "select id from keys where id = $1 for update",
+        [input.keyId],
+      );
+      if (!keyResult.rows[0]) throw notFound("Session not found");
+
       const found = await tx.query<SessionRow>(
         "select * from executor_sessions where id = $1 and key_id = $2 for update",
         [input.sessionId, input.keyId],
