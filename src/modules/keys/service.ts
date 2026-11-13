@@ -1,5 +1,5 @@
-import { badRequest, notFound } from "@/core/errors";
-import { getHwidSecret, getSessionSecret } from "@/core/env";
+import { badRequest, forbidden, notFound } from "@/core/errors";
+import { getHwidSecret, getKeySecretState, getSessionSecret } from "@/core/env";
 import { HwidNormalizationError, hashHwid, hwidFingerprint } from "@/core/crypto/hwid";
 import { clientIp } from "@/core/request-meta";
 import type { Db, DbExecutor } from "@/db/client";
@@ -15,6 +15,7 @@ import {
   hashKeySessionToken,
   hashKeyValue,
   keyDisplayPrefix,
+  type KeyHashVersion,
 } from "@/modules/keys/crypto";
 import { keyDenied, type KeyDenialCode } from "@/modules/keys/errors";
 
@@ -30,13 +31,14 @@ import { keyDenied, type KeyDenialCode } from "@/modules/keys/errors";
 export const KEY_SESSION_TTL_MS = 30 * 60 * 1000;
 export const KEY_SESSION_IDLE_MS = 30 * 60 * 1000;
 const USAGE_DEDUPE_MS = 60 * 1000;
-const DEFAULT_RESET_COOLDOWN_HOURS = 24;
-const DEFAULT_MAX_RESETS = 3;
 
 export interface KeyServiceDeps {
   db?: Db;
   clock?: () => Date;
   sessionSecret?: string;
+  /** Dedicated key-hash material. Falls back to `sessionSecret` as version 1. */
+  keySecret?: string;
+  keySecretVersion?: KeyHashVersion;
   hwidSecret?: string;
   sessionTtlMs?: number;
   idempotencyTtlSeconds?: number;
@@ -59,6 +61,8 @@ export interface GenerateKeysInput {
   expiresAt?: string | null;
   maxActivations: number;
   planId?: string | null;
+  /** When set, the key is bound to this product and gets an admin entitlement. */
+  productId?: string | null;
 }
 
 export interface ActivateInput {
@@ -171,6 +175,11 @@ interface KeyRow {
   expires_at: Date | string | null;
   created_at: Date | string;
   updated_at: Date | string;
+  product_id: string | null;
+  claimed_at: Date | string | null;
+  claim_kind: "executor" | "discord" | null;
+  claim_ref: string | null;
+  key_hash_version: KeyHashVersion;
 }
 
 interface KeySessionRow {
@@ -182,6 +191,7 @@ interface KeySessionRow {
   last_seen_at: Date | string | null;
   revoked_at: Date | string | null;
   created_at: Date | string;
+  session_token_hash_version: KeyHashVersion;
 }
 
 interface Actor {
@@ -237,6 +247,8 @@ export class PostgresKeyService implements KeyService {
   private readonly db: Db;
   private readonly clock: () => Date;
   private readonly sessionSecretOverride: string | undefined;
+  private readonly keySecretOverride: string | undefined;
+  private readonly keySecretVersionOverride: KeyHashVersion | undefined;
   private readonly hwidSecretOverride: string | undefined;
   private readonly sessionTtlMs: number;
   private readonly idempotencyTtlSeconds: number | undefined;
@@ -248,6 +260,8 @@ export class PostgresKeyService implements KeyService {
     // Secrets are resolved lazily so `next build` can collect route
     // configuration without runtime credentials.
     this.sessionSecretOverride = deps.sessionSecret;
+    this.keySecretOverride = deps.keySecret;
+    this.keySecretVersionOverride = deps.keySecretVersion;
     this.hwidSecretOverride = deps.hwidSecret;
     this.sessionTtlMs = deps.sessionTtlMs ?? KEY_SESSION_TTL_MS;
     this.idempotencyTtlSeconds = deps.idempotencyTtlSeconds;
@@ -262,12 +276,54 @@ export class PostgresKeyService implements KeyService {
     return this.hwidSecretOverride ?? getHwidSecret();
   }
 
+  /**
+   * Hash material used for new rows. Version 2 requires the dedicated secret;
+   * without it the service writes version 1 so Phase 4 hashes stay consistent.
+   */
+  private get keyHashState(): { secret: string; version: KeyHashVersion } {
+    if (this.keySecretOverride) {
+      return {
+        secret: this.keySecretOverride,
+        version: this.keySecretVersionOverride ?? "v2",
+      };
+    }
+    const configured = getKeySecretState();
+    if (configured.version === "v1" && this.sessionSecretOverride) {
+      return { secret: this.sessionSecretOverride, version: "v1" };
+    }
+    return configured;
+  }
+
   private hashKey(plaintext: string): string {
-    return hashKeyValue(plaintext, this.sessionSecret);
+    const state = this.keyHashState;
+    return hashKeyValue(plaintext, state.secret, state.version);
+  }
+
+  /** Reads try the configured version first, then the legacy version. */
+  private keyHashCandidates(plaintext: string): string[] {
+    const state = this.keyHashState;
+    const candidates = [hashKeyValue(plaintext, state.secret, state.version)];
+    if (state.version !== "v1") {
+      candidates.push(hashKeyValue(plaintext, this.sessionSecret, "v1"));
+    }
+    return [...new Set(candidates)];
   }
 
   private hashSessionToken(token: string): string {
-    return hashKeySessionToken(token, this.sessionSecret);
+    const state = this.keyHashState;
+    return hashKeySessionToken(token, state.secret, state.version);
+  }
+
+  private sessionTokenHashCandidates(token: string): string[] {
+    const state = this.keyHashState;
+    const candidates = [hashKeySessionToken(token, state.secret, state.version)];
+    if (state.version !== "v1") {
+      candidates.push(hashKeySessionToken(token, this.sessionSecret, "v1"));
+    }
+    if (this.keySecretOverride) {
+      candidates.push(hashKeySessionToken(token, this.keySecretOverride, "v2"));
+    }
+    return [...new Set(candidates)];
   }
 
   private async audit(
@@ -346,20 +402,30 @@ export class PostgresKeyService implements KeyService {
         const plaintext = createPlaintextKey();
         const inserted = await tx.query<{ id: string }>(
           `insert into keys
-             (key_hash, key_prefix, type, status, expires_at, max_activations, plan_id, created_at, updated_at)
-           values ($1, $2, $3, 'unused', $4, $5, $6, $7, $7)
+             (key_hash, key_hash_version, key_prefix, type, status, expires_at, max_activations, plan_id, product_id, created_at, updated_at)
+           values ($1, $2, $3, $4, 'unused', $5, $6, $7, $8, $9, $9)
            returning id`,
           [
             this.hashKey(plaintext),
+            this.keyHashState.version,
             keyDisplayPrefix(plaintext),
             input.type,
             expiresAt ? expiresAt.toISOString() : null,
             input.maxActivations,
             input.planId ?? null,
+            input.productId ?? null,
             now.toISOString(),
           ],
         );
         const keyId = inserted.rows[0]!.id;
+        if (input.productId) {
+          await tx.query(
+            `insert into key_entitlements (key_id, product_id, source, status, created_at)
+             values ($1, $2, 'admin', 'active', $3)
+             on conflict (key_id, product_id) do nothing`,
+            [keyId, input.productId, now.toISOString()],
+          );
+        }
         await this.audit(tx, actor.userId, "key.generate", keyId, {
           type: input.type,
           count: input.count,
@@ -379,7 +445,7 @@ export class PostgresKeyService implements KeyService {
 
   async activate(input: ActivateInput): Promise<ActivateResult> {
     const actor = requireActor(input.session);
-    const keyHash = this.hashKey(input.key);
+    const keyHashes = this.keyHashCandidates(input.key);
     const idempotencyTtl = this.idempotencyTtlSeconds;
 
     const result = await this.persistDenial(() =>
@@ -397,8 +463,8 @@ export class PostgresKeyService implements KeyService {
         run: async (tx) => {
           const now = this.clock();
           const found = await tx.query<KeyRow>(
-            "select * from keys where key_hash = $1 for update",
-            [keyHash],
+            "select * from keys where key_hash = any($1::text[]) for update",
+            [keyHashes],
           );
           const row = found.rows[0];
           if (!row) {
@@ -542,12 +608,13 @@ export class PostgresKeyService implements KeyService {
           const sessionExpiresAt = new Date(now.getTime() + this.sessionTtlMs);
           await tx.query(
             `insert into key_sessions
-             (key_id, user_id, session_token_hash, hwid_fingerprint, status, expires_at, last_seen_at, created_at)
-           values ($1, $2, $3, $4, 'active', $5, $6, $6)`,
+             (key_id, user_id, session_token_hash, session_token_hash_version, hwid_fingerprint, status, expires_at, last_seen_at, created_at)
+           values ($1, $2, $3, $4, $5, 'active', $6, $7, $7)`,
             [
               row.id,
               actor.userId,
               this.hashSessionToken(sessionToken),
+              this.keyHashState.version,
               boundHash ? hwidFingerprint(boundHash) : null,
               sessionExpiresAt.toISOString(),
               now.toISOString(),
@@ -561,6 +628,9 @@ export class PostgresKeyService implements KeyService {
                   user_id = $3,
                   bound_hwid_hash = coalesce($4, bound_hwid_hash),
                   hwid_bound_at = case when $4 is null then hwid_bound_at else $5 end,
+                  claimed_at = coalesce(claimed_at, $5),
+                  claim_kind = coalesce(claim_kind, 'discord'),
+                  claim_ref = coalesce(claim_ref, $2),
                   activation_count = activation_count + 1,
                   updated_at = $5
             where id = $1`,
@@ -649,9 +719,10 @@ export class PostgresKeyService implements KeyService {
 
     return this.persistDenial(() =>
       this.db.transaction(async (tx) => {
-        const found = await tx.query<KeyRow>("select * from keys where key_hash = $1", [
-          this.hashKey(input.key),
-        ]);
+        const found = await tx.query<KeyRow>(
+          "select * from keys where key_hash = any($1::text[])",
+          [this.keyHashCandidates(input.key)],
+        );
         const row = found.rows[0];
         if (!row)
           return this.failValidation(tx, actor, null, "invalid_key", "unknown key", input.request);
@@ -762,8 +833,8 @@ export class PostgresKeyService implements KeyService {
         }
 
         const session = await tx.query<KeySessionRow>(
-          "select * from key_sessions where session_token_hash = $1",
-          [this.hashSessionToken(input.keySessionToken)],
+          "select * from key_sessions where session_token_hash = any($1::text[])",
+          [this.sessionTokenHashCandidates(input.keySessionToken)],
         );
         const keySession = session.rows[0];
         if (
@@ -814,17 +885,22 @@ export class PostgresKeyService implements KeyService {
           );
         }
 
-        const script = await resolveScriptAccess(tx, { publicId: input.scriptId });
-        if (!script) {
+        const access = await resolveScriptAccess(tx, {
+          keyId: row.id,
+          publicId: input.scriptId,
+          now,
+        });
+        if (!access.ok) {
           return this.failValidation(
             tx,
             actor,
             row.id,
-            "not_authorized",
-            "script not eligible",
+            access.code,
+            `script access denied: ${access.code}`,
             input.request,
           );
         }
+        const script = access.script;
 
         const dedupeSince = new Date(now.getTime() - USAGE_DEDUPE_MS);
         const recent = await tx.query<{ id: string }>(
@@ -839,14 +915,16 @@ export class PostgresKeyService implements KeyService {
         if (!grantId) {
           const inserted = await tx.query<{ id: string }>(
             `insert into script_access_logs
-             (script_id, version_id, actor_user_id, key_id, ip, user_agent, result, created_at)
-           values ($1, $2, $3, $4, $5, $6, 'granted', $7)
+             (script_id, version_id, actor_user_id, key_id, entitlement_id, grant_expires_at, ip, user_agent, result, created_at)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, 'granted', $9)
            returning id`,
             [
               script.scriptId,
               script.versionId,
               actor.userId,
               row.id,
+              access.entitlementId,
+              access.grantExpiresAt,
               clientIp(input.request),
               input.request.headers.get("user-agent"),
               now.toISOString(),
@@ -905,151 +983,12 @@ export class PostgresKeyService implements KeyService {
     );
   }
 
-  async resetHwid(input: ResetHwidInput): Promise<ResetHwidBody> {
-    const actor = requireActor(input.session);
-    const idempotencyTtl = this.idempotencyTtlSeconds;
-
-    const result = await this.persistDenial(() =>
-      withIdempotency<ResetHwidBody>({
-        scope: "keys.reset_hwid",
-        key: input.idempotencyKey,
-        request: { keyId: input.keyId, reason: input.reason ?? null },
-        actorId: actor.userId,
-        ...(idempotencyTtl ? { ttlSeconds: idempotencyTtl } : {}),
-        transaction: this.transaction,
-        run: async (tx) => {
-          const now = this.clock();
-          const found = await tx.query<KeyRow>("select * from keys where id = $1 for update", [
-            input.keyId,
-          ]);
-          const row = found.rows[0];
-          if (!row) throw notFound("Key not found");
-          if (row.owner_discord_id !== actor.discordId) {
-            return this.failReset(tx, actor, row.id, "not_owner", "owner mismatch", input.request);
-          }
-          const terminal = terminalStatusDenial(row.status);
-          if (terminal) {
-            return this.failReset(
-              tx,
-              actor,
-              row.id,
-              terminal,
-              `status=${row.status}`,
-              input.request,
-            );
-          }
-          if (row.status !== "active") {
-            return this.failReset(
-              tx,
-              actor,
-              row.id,
-              "key_not_active",
-              `status=${row.status}`,
-              input.request,
-            );
-          }
-
-          const cooldownHours = await this.settingNumber(
-            tx,
-            "hwid.reset_cooldown_hours",
-            DEFAULT_RESET_COOLDOWN_HOURS,
-          );
-          const maxResets = await this.settingNumber(tx, "hwid.max_resets", DEFAULT_MAX_RESETS);
-          const lastReset = toDate(row.last_hwid_reset_at);
-          if (lastReset && now.getTime() - lastReset.getTime() < cooldownHours * 3_600_000) {
-            return this.failReset(
-              tx,
-              actor,
-              row.id,
-              "hwid_reset_cooldown",
-              "cooldown active",
-              input.request,
-            );
-          }
-          if (row.hwid_reset_count >= maxResets) {
-            return this.failReset(
-              tx,
-              actor,
-              row.id,
-              "hwid_reset_limit_reached",
-              "reset cap reached",
-              input.request,
-            );
-          }
-
-          const previousFingerprint = row.bound_hwid_hash
-            ? hwidFingerprint(row.bound_hwid_hash)
-            : null;
-          const updated = await tx.query<{ hwid_reset_count: number }>(
-            `update keys
-              set bound_hwid_hash = null,
-                  hwid_bound_at = null,
-                  last_hwid_reset_at = $2,
-                  hwid_reset_count = hwid_reset_count + 1,
-                  updated_at = $2
-            where id = $1
-            returning hwid_reset_count`,
-            [row.id, now.toISOString()],
-          );
-          const hwidResetCount = updated.rows[0]!.hwid_reset_count;
-
-          await this.revokeKeySessions(tx, row.id, now);
-          await tx.query(
-            `insert into key_hwid_resets
-             (key_id, user_id, performed_by, previous_hwid_fingerprint, new_hwid_fingerprint, reason, created_at)
-           values ($1, $2, 'self', $3, null, $4, $5)`,
-            [row.id, actor.userId, previousFingerprint, input.reason ?? null, now.toISOString()],
-          );
-          await tx.query(
-            `insert into key_device_history
-             (key_id, event, hwid_fingerprint, actor_user_id, ip, metadata, created_at)
-           values ($1, 'reset_self', $2, $3, $4, $5, $6)`,
-            [
-              row.id,
-              previousFingerprint,
-              actor.userId,
-              clientIp(input.request),
-              JSON.stringify({ hwidResetCount }),
-              now.toISOString(),
-            ],
-          );
-          await this.audit(
-            tx,
-            actor.userId,
-            "key.hwid_reset",
-            row.id,
-            {
-              hwidResetCount,
-              reason: input.reason ?? null,
-            },
-            input.request,
-          );
-
-          const nextResetAllowedAt = new Date(now.getTime() + cooldownHours * 3_600_000);
-          return {
-            body: {
-              resetAt: now.toISOString(),
-              hwidResetCount,
-              nextResetAllowedAt:
-                hwidResetCount >= maxResets ? null : nextResetAllowedAt.toISOString(),
-            },
-          };
-        },
-      }),
-    );
-
-    return result.body;
-  }
-
-  private failReset(
-    tx: DbExecutor,
-    actor: Actor,
-    keyId: string | null,
-    code: KeyDenialCode,
-    reason: string,
-    request: Request,
-  ): never {
-    return this.recordDenial(tx, actor, "key.hwid_reset_failed", keyId, code, reason, request);
+  /**
+   * Owner policy: HWID reset is admin-only. Self-service is disabled, so the
+   * legacy entry point fails with a stable error instead of performing a reset.
+   */
+  async resetHwid(_input: ResetHwidInput): Promise<ResetHwidBody> {
+    throw forbidden("Self-service HWID reset is disabled. Contact an administrator.");
   }
 
   async listOwnKeys(session: SessionContext): Promise<Record<string, unknown>[]> {
@@ -1290,13 +1229,21 @@ export class PostgresKeyService implements KeyService {
   }
 
   private async revokeKeySessions(tx: DbExecutor, keyId: string, now: Date): Promise<number> {
-    const result = await tx.query(
+    const web = await tx.query(
       `update key_sessions
           set status = 'revoked', revoked_at = $2
         where key_id = $1 and status = 'active'`,
       [keyId, now.toISOString()],
     );
-    return result.rowCount ?? 0;
+    // Executor sessions are independent of web sessions, so license revocation
+    // and admin HWID resets have to close both.
+    const executor = await tx.query(
+      `update executor_sessions
+          set status = 'revoked', revoked_at = $2
+        where key_id = $1 and status = 'active'`,
+      [keyId, now.toISOString()],
+    );
+    return (web.rowCount ?? 0) + (executor.rowCount ?? 0);
   }
 
   private async deviceHistory(db: DbExecutor, keyId: string): Promise<Record<string, unknown>[]> {
@@ -1340,24 +1287,6 @@ export class PostgresKeyService implements KeyService {
             }
           : null,
     };
-  }
-
-  private async settingNumber(db: DbExecutor, key: string, fallback: number): Promise<number> {
-    const result = await db.query<{ value: unknown }>(
-      "select value from system_settings where key = $1",
-      [key],
-    );
-    const value = result.rows[0]?.value;
-    if (typeof value === "number" && Number.isFinite(value)) return value;
-    if (value && typeof value === "object" && "value" in value) {
-      const nested = Number((value as { value: unknown }).value);
-      if (Number.isFinite(nested)) return nested;
-    }
-    if (typeof value === "string") {
-      const parsed = Number(value);
-      if (Number.isFinite(parsed)) return parsed;
-    }
-    return fallback;
   }
 }
 

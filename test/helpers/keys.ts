@@ -3,9 +3,11 @@ import type { TestDatabase } from "./db";
 import { createTestDatabase } from "./db";
 import { FakeClock } from "./auth";
 import { createKeyService, type KeyService } from "@/modules/keys/service";
+import { createExecutorService, type ExecutorService } from "@/modules/executor/service";
 
 export const TEST_KEY_SESSION_SECRET = "test-key-session-secret-0123456789";
 export const TEST_HWID_SECRET = "test-hwid-secret-value-0123456789";
+export const TEST_KEY_SECRET = "test-dedicated-key-secret-0123456789";
 
 export interface TestUser {
   userId: string;
@@ -17,6 +19,7 @@ export interface TestUser {
 export interface KeyHarness extends TestDatabase {
   clock: FakeClock;
   service: KeyService;
+  executor: ExecutorService;
   owner: TestUser;
   other: TestUser;
 }
@@ -55,14 +58,18 @@ export async function createKeyHarness(options: { clock?: FakeClock } = {}): Pro
     roles: ["user"],
   });
 
-  const service = createKeyService({
+  const shared = {
     db: database.db,
     clock: clock.now,
     sessionSecret: TEST_KEY_SESSION_SECRET,
+    keySecret: TEST_KEY_SECRET,
+    keySecretVersion: "v2" as const,
     hwidSecret: TEST_HWID_SECRET,
-  });
+  };
+  const service = createKeyService(shared);
+  const executor = createExecutorService(shared);
 
-  return { ...database, clock, service, owner, other };
+  return { ...database, clock, service, executor, owner, other };
 }
 
 export function sessionFor(user: TestUser, roles: string[] = user.roles): SessionContext {
@@ -89,6 +96,10 @@ export function requestFor(path = "/api/keys/test"): Request {
   });
 }
 
+/**
+ * Seeds a script plus a product that maps it. Tests must grant the product to a
+ * key explicitly; nothing is entitled by default.
+ */
 export async function seedScript(
   db: TestDatabase["db"],
   input: { publicId: string; status?: string; enabled?: boolean } = { publicId: "script-one" },
@@ -99,5 +110,28 @@ export async function seedScript(
      returning id`,
     [input.publicId, input.publicId, input.status ?? "published", input.enabled ?? true],
   );
-  return result.rows[0]!.id;
+  const scriptId = result.rows[0]!.id;
+
+  const product = await db.query<{ id: string }>(
+    `insert into products (code, name) values ($1, $2)
+     on conflict (code) do update set name = excluded.name
+     returning id`,
+    [`product:${input.publicId}`, `Product for ${input.publicId}`],
+  );
+  await db.query(
+    `insert into product_scripts (product_id, script_id) values ($1, $2)
+     on conflict do nothing`,
+    [product.rows[0]!.id, scriptId],
+  );
+  return scriptId;
+}
+
+/** Grants every product to a key, simulating an approved purchase mapping. */
+export async function entitleKey(db: TestDatabase["db"], keyId: string): Promise<void> {
+  await db.query(
+    `insert into key_entitlements (key_id, product_id, source, status, starts_at)
+     select $1, p.id, 'admin', 'active', $2 from products p
+     on conflict (key_id, product_id) do nothing`,
+    [keyId, "2020-01-01T00:00:00.000Z"],
+  );
 }

@@ -32,6 +32,12 @@ export type ErrorCode =
   | "hwid_reset_limit_reached"
   | "key_not_active"
   | "replay_detected"
+  | "timestamp_invalid"
+  | "entitlement_missing"
+  | "entitlement_expired"
+  | "entitlement_suspended"
+  | "product_inactive"
+  | "script_not_found"
   | "internal_error";
 
 export class AppError extends Error {

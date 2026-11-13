@@ -54,6 +54,11 @@ const envSchema = z
     // Dedicated server key for hashing session tokens and OAuth state. Required
     // in production; a development-only default is used otherwise.
     SESSION_HMAC_SECRET: z.string().min(16).optional(),
+    // Dedicated key material for license-key and executor-token hashing. When
+    // absent, version 1 hashes continue to use SESSION_HMAC_SECRET so existing
+    // keys keep validating; when present, new material is hashed as version 2.
+    KEY_HMAC_SECRET: z.string().min(16).optional(),
+    KEY_HMAC_KEY_VERSION: z.enum(["v1", "v2"]).default("v2"),
     // D5 (owner-approved v1): server-only key for HMAC-SHA-256 of normalized
     // HWIDs. Required in production; a development-only default is used otherwise.
     HWID_HASH_SECRET: z.string().min(16).optional(),
@@ -127,6 +132,25 @@ export function getSessionSecret(source: NodeJS.ProcessEnv = process.env): strin
     throw new Error("SESSION_HMAC_SECRET is required in production");
   }
   return "development-only-session-secret-change-me";
+}
+
+/**
+ * Key-hashing material plus the version new hashes are written with.
+ *
+ * Version 2 uses the dedicated `KEY_HMAC_SECRET`. Without it the loader stays
+ * on version 1 with `SESSION_HMAC_SECRET`; that keeps every Phase 4 hash
+ * valid without storing or re-deriving plaintext keys. Reads always try both
+ * versions, so a secret can be introduced later without a data migration.
+ */
+export function getKeySecretState(source: NodeJS.ProcessEnv = process.env): {
+  secret: string;
+  version: "v1" | "v2";
+} {
+  const env = loadEnv(source);
+  if (env.KEY_HMAC_SECRET) {
+    return { secret: env.KEY_HMAC_SECRET, version: env.KEY_HMAC_KEY_VERSION };
+  }
+  return { secret: getSessionSecret(source), version: "v1" };
 }
 
 /**

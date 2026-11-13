@@ -1,13 +1,17 @@
 import type { DbExecutor } from "@/db/client";
 
 /**
- * Phase 4 access orchestration: a key is only useful if the requested script is
- * eligible. Phase 3 catalog APIs are not present yet, so eligibility is read
- * directly from the reviewed `scripts` table by `public_id`.
+ * Entitlement-aware access resolution.
  *
- * There is no plan/key-type-to-script mapping in the approved schema. Until
- * Phase 5 introduces one, every valid key may reach every published script.
- * That limitation is recorded in the Phase 4 implementation report.
+ * A key reaches a script only when all of the following hold:
+ *   - the script exists, is published, enabled, and not deleted;
+ *   - the key has an `active` entitlement for a product that is `active`;
+ *   - that product maps the script through `product_scripts`;
+ *   - the entitlement is inside its start/expiry window.
+ *
+ * There is deliberately no fallback that grants a valid key every published
+ * script. Legacy keys receive a legacy entitlement, but the legacy product has
+ * no script mapping until an owner explicitly adds one.
  */
 
 export interface EligibleScript {
@@ -16,11 +20,49 @@ export interface EligibleScript {
   versionId: string | null;
 }
 
+export type ScriptAccessDenialCode =
+  | "script_not_found"
+  | "entitlement_missing"
+  | "entitlement_expired"
+  | "entitlement_suspended"
+  | "product_inactive";
+
+export type ScriptAccessResult =
+  | {
+      ok: true;
+      script: EligibleScript;
+      entitlementId: string;
+      productId: string;
+      grantExpiresAt: string | null;
+    }
+  | { ok: false; code: ScriptAccessDenialCode };
+
+interface ScriptRow {
+  scriptId: string;
+  publicId: string;
+  versionId: string | null;
+}
+
+interface EntitlementRow {
+  id: string;
+  product_id: string;
+  status: string;
+  starts_at: Date | string;
+  expires_at: Date | string | null;
+  product_active: boolean;
+}
+
+function asTime(value: Date | string): number {
+  return value instanceof Date ? value.getTime() : new Date(value).getTime();
+}
+
 export async function resolveScriptAccess(
   db: DbExecutor,
-  input: { publicId: string },
-): Promise<EligibleScript | null> {
-  const result = await db.query<EligibleScript>(
+  input: { keyId: string; publicId: string; now?: Date },
+): Promise<ScriptAccessResult> {
+  const now = input.now ?? new Date();
+
+  const scriptResult = await db.query<ScriptRow>(
     `select s.id as "scriptId", s.public_id as "publicId", s.current_version_id as "versionId"
        from scripts s
       where s.public_id = $1
@@ -29,5 +71,57 @@ export async function resolveScriptAccess(
         and s.deleted_at is null`,
     [input.publicId],
   );
-  return result.rows[0] ?? null;
+  const script = scriptResult.rows[0];
+  if (!script) return { ok: false, code: "script_not_found" };
+
+  const entitlements = await db.query<EntitlementRow>(
+    `select ke.id, ke.product_id, ke.status, ke.starts_at, ke.expires_at, p.active as product_active
+       from key_entitlements ke
+       join products p on p.id = ke.product_id
+       join product_scripts ps on ps.product_id = ke.product_id and ps.script_id = $2
+      where ke.key_id = $1
+      order by ke.created_at desc, ke.id desc`,
+    [input.keyId, script.scriptId],
+  );
+
+  if (entitlements.rows.length === 0) return { ok: false, code: "entitlement_missing" };
+
+  let sawInactiveProduct = false;
+  let sawSuspended = false;
+  let sawExpired = false;
+
+  for (const row of entitlements.rows) {
+    if (row.status === "suspended" || row.status === "revoked") {
+      sawSuspended = true;
+      continue;
+    }
+    if (!row.product_active) {
+      sawInactiveProduct = true;
+      continue;
+    }
+    if (row.status !== "active") {
+      sawExpired = true;
+      continue;
+    }
+    if (asTime(row.starts_at) > now.getTime()) {
+      sawExpired = true;
+      continue;
+    }
+    if (row.expires_at && asTime(row.expires_at) <= now.getTime()) {
+      sawExpired = true;
+      continue;
+    }
+    return {
+      ok: true,
+      script,
+      entitlementId: row.id,
+      productId: row.product_id,
+      grantExpiresAt: row.expires_at ? new Date(row.expires_at).toISOString() : null,
+    };
+  }
+
+  if (sawSuspended) return { ok: false, code: "entitlement_suspended" };
+  if (sawInactiveProduct) return { ok: false, code: "product_inactive" };
+  if (sawExpired) return { ok: false, code: "entitlement_expired" };
+  return { ok: false, code: "entitlement_missing" };
 }

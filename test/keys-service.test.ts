@@ -4,6 +4,7 @@ import { resetEnvCache } from "@/core/env";
 import { AppError } from "@/core/errors";
 import {
   createKeyHarness,
+  entitleKey,
   requestFor,
   seedScript,
   sessionFor,
@@ -35,6 +36,7 @@ async function generate(
     maxActivations: options.maxActivations ?? 1,
     ...(options.expiresAt !== undefined ? { expiresAt: options.expiresAt } : {}),
   });
+  await entitleKey(harness.db, generated[0]!.keyId);
   return generated[0]!;
 }
 
@@ -256,7 +258,46 @@ describe("validation", () => {
             keySessionToken: activated.body.keySessionToken!,
           }),
         ),
-      ).toBe("not_authorized");
+      ).toBe("script_not_found");
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("denies a published script the key is not entitled to", async () => {
+    const harness = await createKeyHarness();
+    try {
+      await seedScript(harness.db, { publicId: "script-one" });
+      await seedScript(harness.db, { publicId: "script-two" });
+      const generated = await harness.service.generateKeys({
+        session: sessionFor(harness.owner),
+        request: requestFor(),
+        count: 1,
+        type: "paid",
+        maxActivations: 1,
+      });
+      // Grant only the first product, not script-two's.
+      const product = await harness.db.query<{ id: string }>(
+        "select id from products where code = $1",
+        ["product:script-one"],
+      );
+      await harness.db.query(
+        `insert into key_entitlements (key_id, product_id, source, status, starts_at)
+         values ($1, $2, 'admin', 'active', '2020-01-01T00:00:00.000Z')`,
+        [generated[0]!.keyId, product.rows[0]!.id],
+      );
+      const activated = await activate(harness, generated[0]!.key);
+      expect(
+        await errorCode(
+          harness.service.validate({
+            session: ownerSession(harness),
+            request: requestFor(),
+            key: generated[0]!.key,
+            scriptId: "script-two",
+            keySessionToken: activated.body.keySessionToken!,
+          }),
+        ),
+      ).toBe("entitlement_missing");
     } finally {
       await harness.close();
     }
@@ -288,11 +329,11 @@ describe("terminal status gates", () => {
       ).toBe("banned_key");
       expect(
         await errorCode(
-          harness.service.resetHwid({
-            session: ownerSession(harness),
+          harness.service.adminResetHwid({
+            session: sessionFor(harness.owner),
             request: requestFor(),
             keyId: generated.keyId,
-            idempotencyKey: randomUUID(),
+            reason: "route test",
           }),
         ),
       ).toBe("banned_key");
@@ -347,21 +388,12 @@ describe("suspended keys and reactivation authorization", () => {
   });
 });
 
-describe("HWID reset", () => {
-  it("enforces the cooldown and revokes the current session", async () => {
+describe("admin-only HWID reset", () => {
+  it("disables self-service reset", async () => {
     const harness = await createKeyHarness();
     try {
-      await seedScript(harness.db, { publicId: "script-one" });
       const generated = await generate(harness);
-      const activated = await activate(harness, generated.key, { hwid: "abcdef123456" });
-      const reset = await harness.service.resetHwid({
-        session: ownerSession(harness),
-        request: requestFor(),
-        keyId: generated.keyId,
-        idempotencyKey: randomUUID(),
-      });
-      expect(reset.hwidResetCount).toBe(1);
-
+      await activate(harness, generated.key, { hwid: "abcdef123456" });
       expect(
         await errorCode(
           harness.service.resetHwid({
@@ -371,7 +403,33 @@ describe("HWID reset", () => {
             idempotencyKey: randomUUID(),
           }),
         ),
-      ).toBe("hwid_reset_cooldown");
+      ).toBe("forbidden");
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("admin reset clears the device binding and revokes the session", async () => {
+    const harness = await createKeyHarness();
+    try {
+      await seedScript(harness.db, { publicId: "script-one" });
+      const generated = await generate(harness);
+      const activated = await activate(harness, generated.key, { hwid: "abcdef123456" });
+
+      const first = await harness.service.adminResetHwid({
+        session: sessionFor(harness.owner),
+        request: requestFor(),
+        keyId: generated.keyId,
+        reason: "support request",
+      });
+      expect(first.performedBy).toBe("admin");
+
+      const row = await harness.db.query<{
+        bound_hwid_hash: string | null;
+        hwid_reset_count: number;
+      }>("select bound_hwid_hash, hwid_reset_count from keys where id = $1", [generated.keyId]);
+      expect(row.rows[0]!.bound_hwid_hash).toBeNull();
+      expect(row.rows[0]!.hwid_reset_count).toBe(1);
 
       expect(
         await errorCode(
@@ -384,39 +442,42 @@ describe("HWID reset", () => {
           }),
         ),
       ).toBe("session_required");
+
+      const resets = await harness.db.query<{ performed_by: string; admin_id: string | null }>(
+        "select performed_by, admin_id from key_hwid_resets where key_id = $1",
+        [generated.keyId],
+      );
+      expect(resets.rows).toEqual([{ performed_by: "admin", admin_id: harness.owner.userId }]);
+
+      const history = await harness.service.adminDevices(ownerSession(harness), generated.keyId);
+      expect(history.map((entry) => entry.event)).toContain("reset_admin");
     } finally {
       await harness.close();
     }
   });
 
-  it("enforces the configured cap", async () => {
+  it("keeps reset history when an admin resets twice", async () => {
     const harness = await createKeyHarness();
     try {
-      await harness.db.query(
-        `insert into system_settings (key, value) values
-           ('hwid.reset_cooldown_hours', '0'::jsonb),
-           ('hwid.max_resets', '1'::jsonb)`,
-      );
       const generated = await generate(harness);
       await activate(harness, generated.key, { hwid: "abcdef123456" });
-      const first = await harness.service.resetHwid({
-        session: ownerSession(harness),
+      await harness.service.adminResetHwid({
+        session: sessionFor(harness.owner),
         request: requestFor(),
         keyId: generated.keyId,
-        idempotencyKey: randomUUID(),
+        reason: "first",
       });
-      expect(first.hwidResetCount).toBe(1);
-      expect(first.nextResetAllowedAt).toBeNull();
-      expect(
-        await errorCode(
-          harness.service.resetHwid({
-            session: ownerSession(harness),
-            request: requestFor(),
-            keyId: generated.keyId,
-            idempotencyKey: randomUUID(),
-          }),
-        ),
-      ).toBe("hwid_reset_limit_reached");
+      await harness.service.adminResetHwid({
+        session: sessionFor(harness.owner),
+        request: requestFor(),
+        keyId: generated.keyId,
+        reason: "second",
+      });
+      const resets = await harness.db.query<{ count: number }>(
+        "select count(*)::int as count from key_hwid_resets where key_id = $1",
+        [generated.keyId],
+      );
+      expect(resets.rows[0]!.count).toBe(2);
     } finally {
       await harness.close();
     }
@@ -474,29 +535,30 @@ describe("admin controls and owner reads", () => {
     }
   });
 
-  it("admin reset bypasses the user cooldown and is attributed to the admin", async () => {
+  it("records the admin actor and reason for a reset", async () => {
     const harness = await createKeyHarness();
     try {
       const generated = await generate(harness);
       await activate(harness, generated.key, { hwid: "abcdef123456" });
-      await harness.service.resetHwid({
-        session: ownerSession(harness),
-        request: requestFor(),
-        keyId: generated.keyId,
-        idempotencyKey: randomUUID(),
-      });
-      const adminReset = await harness.service.adminResetHwid({
+      await harness.service.adminResetHwid({
         session: sessionFor(harness.owner),
         request: requestFor(),
         keyId: generated.keyId,
         reason: "support request",
       });
-      expect(adminReset.performedBy).toBe("admin");
 
-      const history = await harness.service.adminDevices(ownerSession(harness), generated.keyId);
-      expect(history.map((entry) => entry.event)).toEqual(
-        expect.arrayContaining(["reset_self", "reset_admin"]),
+      const audit = await harness.db.query<{ action: string; actor_user_id: string }>(
+        "select action, actor_user_id from audit_logs where target_id = $1 and action = 'key.hwid_reset_admin'",
+        [generated.keyId],
       );
+      expect(audit.rows).toHaveLength(1);
+      expect(audit.rows[0]!.actor_user_id).toBe(harness.owner.userId);
+
+      const reset = await harness.db.query<{ reason: string }>(
+        "select reason from key_hwid_resets where key_id = $1",
+        [generated.keyId],
+      );
+      expect(reset.rows[0]!.reason).toBe("support request");
     } finally {
       await harness.close();
     }

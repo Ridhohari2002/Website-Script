@@ -4,7 +4,7 @@ import { resetEnvCache } from "@/core/env";
 import { createKeyService } from "@/modules/keys/service";
 import { createAuthHarness, type AuthHarness } from "./helpers/auth";
 import { BASE, createHttpHarness, ORIGIN, performLogin } from "./helpers/http";
-import { seedScript, TEST_HWID_SECRET, TEST_KEY_SESSION_SECRET } from "./helpers/keys";
+import { entitleKey, seedScript, TEST_HWID_SECRET, TEST_KEY_SESSION_SECRET } from "./helpers/keys";
 
 afterAll(() => resetEnvCache());
 
@@ -41,7 +41,9 @@ async function generateKey(harness: AuthHarness) {
   );
   expect(response.status).toBe(201);
   const body = await response.json();
-  return { handler, login, key: body.keys[0] as { keyId: string; key: string } };
+  const key = body.keys[0] as { keyId: string; key: string };
+  await entitleKey(harness.db, key.keyId);
+  return { handler, login, key };
 }
 
 describe("key HTTP endpoints", () => {
@@ -108,7 +110,7 @@ describe("key HTTP endpoints", () => {
       expect(deviceBody.devices[0].event).toBe("bound");
       expect(JSON.stringify(deviceBody)).not.toContain("abcdef123456");
 
-      const reset = await handler.call(
+      const selfReset = await handler.call(
         null,
         new Request(`${BASE}/api/keys/reset-hwid`, {
           method: "POST",
@@ -117,8 +119,19 @@ describe("key HTTP endpoints", () => {
         }),
         ["keys", "reset-hwid"],
       );
+      expect(selfReset.status).toBe(404);
+
+      const reset = await handler.call(
+        null,
+        new Request(`${BASE}/api/admin/keys/${key.keyId}/reset-hwid`, {
+          method: "POST",
+          headers: headers(login.cookie, login.csrf),
+          body: JSON.stringify({ reason: "support request" }),
+        }),
+        ["admin", "keys", key.keyId, "reset-hwid"],
+      );
       expect(reset.status).toBe(200);
-      expect((await reset.json()).hwidResetCount).toBe(1);
+      expect((await reset.json()).performedBy).toBe("admin");
     } finally {
       await harness.close();
     }

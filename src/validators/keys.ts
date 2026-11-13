@@ -23,13 +23,6 @@ export const validateSchema = z
   })
   .strict();
 
-export const resetHwidSchema = z
-  .object({
-    keyId: z.string().uuid(),
-    reason: reason.optional(),
-  })
-  .strict();
-
 export const adminResetHwidSchema = z
   .object({
     reason: z.string().trim().min(1).max(500),
@@ -49,6 +42,7 @@ export const adminGenerateSchema = z
     expiresAt: z.string().datetime().optional(),
     maxActivations: z.coerce.number().int().min(1).max(100).default(1),
     planId: z.string().uuid().optional(),
+    productId: z.string().uuid().optional(),
   })
   .strict();
 

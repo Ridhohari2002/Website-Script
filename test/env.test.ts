@@ -3,6 +3,7 @@ import {
   getDatabaseUrl,
   getDiscordOwnerId,
   getHwidSecret,
+  getKeySecretState,
   getRateLimitSecret,
   loadEnv,
   resetEnvCache,
@@ -85,6 +86,23 @@ describe("environment loader", () => {
     expect(
       getDiscordOwnerId({ DISCORD_OWNER_ID: "   " } as unknown as NodeJS.ProcessEnv),
     ).toBeNull();
+  });
+
+  it("uses a dedicated key secret when configured and falls back to v1 otherwise", () => {
+    const configured = getKeySecretState({
+      KEY_HMAC_SECRET: "dedicated-key-secret-0123456789",
+      SESSION_HMAC_SECRET: "session-secret-0123456789",
+    } as unknown as NodeJS.ProcessEnv);
+    expect(configured).toEqual({
+      secret: "dedicated-key-secret-0123456789",
+      version: "v2",
+    });
+
+    resetEnvCache();
+    const fallback = getKeySecretState({
+      SESSION_HMAC_SECRET: "session-secret-0123456789",
+    } as unknown as NodeJS.ProcessEnv);
+    expect(fallback).toEqual({ secret: "session-secret-0123456789", version: "v1" });
   });
 
   it("uses the development-only HWID secret outside production", () => {

@@ -13,7 +13,6 @@ import {
   adminRevokeSchema,
   bearerToken,
   keyIdSchema,
-  resetHwidSchema,
   requireIdempotencyKey,
   validateSchema,
 } from "@/validators/keys";
@@ -28,8 +27,6 @@ const ACTIVATE_USER_LIMIT = 10;
 const ACTIVATE_IP_LIMIT = 30;
 const VALIDATE_USER_LIMIT = 120;
 const VALIDATE_IP_LIMIT = 240;
-const RESET_USER_LIMIT = 5;
-const RESET_IP_LIMIT = 15;
 
 const idSchema = z.string().uuid();
 
@@ -104,29 +101,6 @@ export function keyRoutes(service: KeyService): RouteDefinition[] {
       },
     },
     {
-      method: "POST",
-      pattern: ["keys", "reset-hwid"],
-      access: "user",
-      rateLimit: (context) =>
-        userKeyLimit(context).map((dimension) => ({
-          ...dimension,
-          limit: dimension.kind === "user" ? RESET_USER_LIMIT : RESET_IP_LIMIT,
-        })),
-      async handler({ session, request, requestId }) {
-        if (!session) throw new Error("session missing after access gate");
-        const body = validate(resetHwidSchema, await readJsonBody(request));
-        const idempotencyKey = requireIdempotencyKey(request);
-        const result = await service.resetHwid({
-          session,
-          request,
-          keyId: body.keyId,
-          ...(body.reason ? { reason: body.reason } : {}),
-          idempotencyKey,
-        });
-        return jsonResponse(result, { status: 200, requestId });
-      },
-    },
-    {
       method: "GET",
       pattern: ["keys", "me"],
       access: "user",
@@ -173,6 +147,7 @@ export function keyRoutes(service: KeyService): RouteDefinition[] {
           ...(body.expiresAt ? { expiresAt: body.expiresAt } : {}),
           maxActivations: body.maxActivations,
           ...(body.planId ? { planId: body.planId } : {}),
+          ...(body.productId ? { productId: body.productId } : {}),
         });
         return jsonResponse({ keys }, { status: 201, requestId });
       },

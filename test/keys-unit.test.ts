@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   createPlaintextKey,
+  hashExecutorSessionToken,
   hashKeySessionToken,
   hashKeyValue,
   keyDisplayPrefix,
@@ -34,6 +35,19 @@ describe("key material", () => {
     expect(keyHash).not.toContain(key);
     expect(keyHash).not.toBe(sessionHash);
     expect(hashKeyValue(key, secret)).toBe(keyHash);
+  });
+
+  it("keeps v1 and v2 hashes distinct and executor tokens domain-separated", () => {
+    const secret = "test-secret-0123456789";
+    const value = createPlaintextKey();
+
+    const v1 = hashKeyValue(value, secret, "v1");
+    const v2 = hashKeyValue(value, secret, "v2");
+    expect(v1).not.toBe(v2);
+    expect(hashKeySessionToken(value, secret, "v2")).not.toBe(v2);
+    expect(hashExecutorSessionToken(value, secret, "v2")).not.toBe(
+      hashKeySessionToken(value, secret, "v2"),
+    );
   });
 });
 
