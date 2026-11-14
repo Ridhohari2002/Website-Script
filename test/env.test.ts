@@ -6,6 +6,7 @@ import {
   getHwidSecret,
   getKeySecretState,
   getRateLimitSecret,
+  getTrustedProxySecret,
   loadEnv,
   resetEnvCache,
 } from "@/core/env";
@@ -138,6 +139,25 @@ describe("environment loader", () => {
       SESSION_HMAC_SECRET: "session-secret-0123456789",
     } as unknown as NodeJS.ProcessEnv);
     expect(fallback).toEqual({ secret: "session-secret-0123456789", version: "v1" });
+  });
+
+  it("treats an absent or empty trusted proxy secret as not configured", () => {
+    expect(getTrustedProxySecret({} as unknown as NodeJS.ProcessEnv)).toBeNull();
+    expect(
+      getTrustedProxySecret({ TRUSTED_PROXY_SECRET: "" } as unknown as NodeJS.ProcessEnv),
+    ).toBeNull();
+    resetEnvCache();
+    expect(
+      getTrustedProxySecret({
+        TRUSTED_PROXY_SECRET: "test-trusted-proxy-secret-0123456789",
+      } as unknown as NodeJS.ProcessEnv),
+    ).toBe("test-trusted-proxy-secret-0123456789");
+  });
+
+  it("rejects a too-short trusted proxy secret", () => {
+    expect(() =>
+      loadEnv({ TRUSTED_PROXY_SECRET: "short" } as unknown as NodeJS.ProcessEnv),
+    ).toThrow(/TRUSTED_PROXY_SECRET/);
   });
 
   it("uses the development-only HWID secret outside production", () => {

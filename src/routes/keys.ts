@@ -44,12 +44,15 @@ function userKeyLimit(context: {
       windowSeconds: KEY_WINDOW_SECONDS,
     });
   }
-  dimensions.push({
-    kind: "ip",
-    value: clientIp(context.request) ?? "unknown",
-    limit: ACTIVATE_IP_LIMIT,
-    windowSeconds: KEY_WINDOW_SECONDS,
-  });
+  const ip = clientIp(context.request);
+  if (ip) {
+    dimensions.push({
+      kind: "ip",
+      value: ip,
+      limit: ACTIVATE_IP_LIMIT,
+      windowSeconds: KEY_WINDOW_SECONDS,
+    });
+  }
   return dimensions;
 }
 

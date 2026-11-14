@@ -62,6 +62,13 @@ const envSchema = z
     // D5 (owner-approved v1): server-only key for HMAC-SHA-256 of normalized
     // HWIDs. Required in production; a development-only default is used otherwise.
     HWID_HASH_SECRET: z.string().min(16).optional(),
+    // Server-only marker the trusted reverse proxy injects after stripping any
+    // client-supplied value. Optional: when absent, no forwarded IP is trusted
+    // and IP rate limiting is disabled rather than collapsed into one bucket.
+    TRUSTED_PROXY_SECRET: z.preprocess(
+      (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+      z.string().min(16).optional(),
+    ),
   })
   .superRefine((value, ctx) => {
     if (value.NODE_ENV === "production" && !value.RATE_LIMIT_HMAC_SECRET) {
@@ -201,6 +208,16 @@ export function getHwidSecret(source: NodeJS.ProcessEnv = process.env): string {
     throw new Error("HWID_HASH_SECRET is required in production");
   }
   return "development-only-hwid-secret-change-me";
+}
+
+/**
+ * Server-only marker expected from the trusted reverse proxy. Returns null when
+ * the deployment has not configured one, which means no client IP is trusted.
+ * There is deliberately no development default: a public default would let any
+ * caller forge the marker.
+ */
+export function getTrustedProxySecret(source: NodeJS.ProcessEnv = process.env): string | null {
+  return loadEnv(source).TRUSTED_PROXY_SECRET ?? null;
 }
 
 /** Cookies carry `Secure` on HTTPS origins and in production, never on http://localhost. */

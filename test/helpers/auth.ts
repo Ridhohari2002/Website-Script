@@ -4,6 +4,7 @@ import { createAuthService, type AuthService } from "@/modules/auth/service";
 import type { DiscordOAuthClient, DiscordProfile } from "@/providers/discord/client";
 import type { DiscordOAuthConfig } from "@/providers/discord/config";
 import { createTestDatabase, type TestDatabase } from "./db";
+import { trustedProxyHeaders } from "./proxy";
 
 export const TEST_SESSION_SECRET = "test-session-secret-value-0123456789";
 
@@ -128,7 +129,7 @@ export async function loginThroughService(
     cookie: `${OAUTH_STATE_COOKIE}=${state}`,
     "user-agent": "vitest",
   };
-  if (options.ip) headers["x-forwarded-for"] = options.ip;
+  if (options.ip) Object.assign(headers, trustedProxyHeaders(options.ip));
 
   const request = new Request(
     `http://localhost:3000/api/auth/callback?code=${encodeURIComponent(code ?? "")}&state=${encodeURIComponent(state)}`,

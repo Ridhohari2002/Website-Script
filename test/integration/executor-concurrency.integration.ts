@@ -14,6 +14,7 @@ import {
   type PgTestDatabase,
 } from "../helpers/pg-db";
 import { createTestRateLimiter } from "../helpers/keys";
+import { trustedProxyHeaders } from "../helpers/proxy";
 
 /**
  * Deterministic real-PostgreSQL concurrency tests.
@@ -78,7 +79,7 @@ function request(path: string): Request {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-forwarded-for": `198.51.100.${randomInt(1, 250)}`,
+      ...trustedProxyHeaders(`198.51.100.${randomInt(1, 250)}`),
       "user-agent": "executor-concurrency-test",
     },
   });
@@ -126,13 +127,21 @@ async function backendPid(client: Client): Promise<number> {
 async function verifySchema(db: Db): Promise<void> {
   const migrations = await db.query<{ filename: string }>(
     "select filename from schema_migrations where filename = any($1::text[])",
-    [["0001_init.sql", "0002_executor_first.sql", "0003_executor_review_fixes.sql"]],
+    [
+      [
+        "0001_init.sql",
+        "0002_executor_first.sql",
+        "0003_executor_review_fixes.sql",
+        "0004_payment_status_default.sql",
+      ],
+    ],
   );
   const found = new Set(migrations.rows.map((row) => row.filename));
   for (const filename of [
     "0001_init.sql",
     "0002_executor_first.sql",
     "0003_executor_review_fixes.sql",
+    "0004_payment_status_default.sql",
   ]) {
     if (!found.has(filename)) {
       throw new Error(`${filename} is not recorded. Run npm run db:migrate:test first.`);
@@ -478,6 +487,41 @@ async function withBlocker(
     }
     await client.end();
   }
+}
+
+const VALIDATION_PAUSE_LOCK_KEY = 918273645;
+const VALIDATION_PAUSE_FUNCTION = "boyfinity_test_pause_script_access";
+const VALIDATION_PAUSE_TRIGGER = "boyfinity_test_pause_script_access";
+
+/**
+ * Pauses a validation transaction at its grant insert, after every eligibility
+ * share lock is held. The blocker connection holds the advisory lock, so the
+ * pause is deterministic and does not depend on timing.
+ */
+async function installValidationPause(fixture: Fixture): Promise<void> {
+  await fixture.database.db.query(
+    `create or replace function ${VALIDATION_PAUSE_FUNCTION}() returns trigger
+     language plpgsql as $$
+     begin
+       perform pg_advisory_xact_lock(${VALIDATION_PAUSE_LOCK_KEY});
+       return new;
+     end;
+     $$`,
+  );
+  await fixture.database.db.query(
+    `create trigger ${VALIDATION_PAUSE_TRIGGER}
+       before insert on script_access_logs
+       for each row execute function ${VALIDATION_PAUSE_FUNCTION}()`,
+  );
+}
+
+async function removeValidationPause(fixture: Fixture): Promise<void> {
+  await fixture.database.db
+    .query(`drop trigger if exists ${VALIDATION_PAUSE_TRIGGER} on script_access_logs`)
+    .catch(() => undefined);
+  await fixture.database.db
+    .query(`drop function if exists ${VALIDATION_PAUSE_FUNCTION}()`)
+    .catch(() => undefined);
 }
 
 async function assertNoDeadlock(results: PromiseSettledResult<unknown>[]): Promise<void> {
@@ -1120,6 +1164,172 @@ describe("executor concurrency (deterministic real PostgreSQL)", () => {
       const state = await keyState(fixture);
       expect(state.activation_count).toBe(1);
       expect(await activeSessionIds(fixture)).toEqual([first.sessionId]);
+    });
+  });
+
+  it("F1-A. product deactivation blocks validation and denies after it commits", async () => {
+    await withFixture({}, async (fixture) => {
+      const first = await activate(fixture);
+
+      await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+        await client.query("update products set active = false where id = $1", [fixture.productId]);
+
+        const validation = validate(fixture, first.sessionToken);
+        const wait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes("for share of ke, p, ps") && waiter.blockers.includes(blockerPid),
+          "validation waiting on the product share lock",
+        );
+        expect(wait.pid).not.toBe(blockerPid);
+
+        await release("commit");
+
+        const settled = await withTimeout(
+          Promise.allSettled([validation]),
+          "product deactivation settlement",
+        );
+        await assertNoDeadlock(settled);
+        expect(rejectedCode(settled[0]!)).toBe("product_inactive");
+      });
+
+      expect(await grantCount(fixture)).toBe(0);
+      expect(await nonceCount(fixture)).toBe(0);
+      const state = await keyState(fixture);
+      expect(state.user_id).toBe(fixture.userId);
+      expect(state.owner_discord_id).toBeNull();
+    });
+  });
+
+  it("F1-B. mapping removal blocks validation and denies after it commits", async () => {
+    await withFixture({}, async (fixture) => {
+      const first = await activate(fixture);
+
+      await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+        await client.query("delete from product_scripts where product_id = $1 and script_id = $2", [
+          fixture.productId,
+          fixture.scriptId,
+        ]);
+
+        const validation = validate(fixture, first.sessionToken);
+        const wait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes("for share of ke, p, ps") && waiter.blockers.includes(blockerPid),
+          "validation waiting on the mapping share lock",
+        );
+        expect(wait.pid).not.toBe(blockerPid);
+
+        await release("commit");
+
+        const settled = await withTimeout(
+          Promise.allSettled([validation]),
+          "mapping removal settlement",
+        );
+        await assertNoDeadlock(settled);
+        expect(rejectedCode(settled[0]!)).toBe("entitlement_missing");
+      });
+
+      expect(await grantCount(fixture)).toBe(0);
+      expect(await nonceCount(fixture)).toBe(0);
+      const state = await keyState(fixture);
+      expect(state.user_id).toBe(fixture.userId);
+      expect(state.owner_discord_id).toBeNull();
+    });
+  });
+
+  it("F1-C. script unpublishing blocks validation and denies after it commits", async () => {
+    await withFixture({}, async (fixture) => {
+      const first = await activate(fixture);
+
+      await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+        await client.query("update scripts set status = 'draft' where id = $1", [fixture.scriptId]);
+
+        const validation = validate(fixture, first.sessionToken);
+        const wait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes("for share of s") && waiter.blockers.includes(blockerPid),
+          "validation waiting on the script share lock",
+        );
+        expect(wait.pid).not.toBe(blockerPid);
+
+        await release("commit");
+
+        const settled = await withTimeout(
+          Promise.allSettled([validation]),
+          "script unpublish settlement",
+        );
+        await assertNoDeadlock(settled);
+        expect(rejectedCode(settled[0]!)).toBe("script_not_found");
+      });
+
+      expect(await grantCount(fixture)).toBe(0);
+      expect(await nonceCount(fixture)).toBe(0);
+      const state = await keyState(fixture);
+      expect(state.user_id).toBe(fixture.userId);
+      expect(state.owner_discord_id).toBeNull();
+    });
+  });
+
+  it("F1-D. validation-first holds the share locks, so an admin change waits for it", async () => {
+    await withFixture({}, async (fixture) => {
+      const first = await activate(fixture);
+      await installValidationPause(fixture);
+      try {
+        await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+          // The trigger takes this transaction-scoped advisory lock, which the
+          // blocker already holds. Validation therefore stops after acquiring
+          // every eligibility share lock but before committing its grant.
+          await client.query("select pg_advisory_xact_lock($1)", [VALIDATION_PAUSE_LOCK_KEY]);
+
+          const validation = validate(fixture, first.sessionToken);
+          const pauseWait = await waitForWaiter(
+            fixture,
+            (waiter) =>
+              waiter.pid !== blockerPid && waiter.query.includes("insert into script_access_logs"),
+            "validation paused at the grant insert",
+          );
+
+          const admin = tracked(
+            fixture.database.db.query("update products set active = false where id = $1", [
+              fixture.productId,
+            ]),
+          );
+          const adminWait = await waitForWaiter(
+            fixture,
+            (waiter) =>
+              waiter.pid !== blockerPid &&
+              waiter.pid !== pauseWait.pid &&
+              waiter.query.includes("update products set active = false"),
+            "admin update waiting on the validation share lock",
+          );
+          expect(adminWait.blockers).toContain(pauseWait.pid);
+
+          await release("commit");
+
+          const settled = await withTimeout(
+            Promise.allSettled([validation, admin]),
+            "validation-first admin change settlement",
+          );
+          await assertNoDeadlock(settled);
+          expect(fulfilled(settled[0]!).sessionId).toBe(first.sessionId);
+          expect(settled[1]!.status).toBe("fulfilled");
+        });
+
+        expect(await grantCount(fixture)).toBe(1);
+        expect(await nonceCount(fixture)).toBe(1);
+        const product = await fixture.database.db.query<{ active: boolean }>(
+          "select active from products where id = $1",
+          [fixture.productId],
+        );
+        expect(product.rows[0]!.active).toBe(false);
+        const state = await keyState(fixture);
+        expect(state.user_id).toBe(fixture.userId);
+        expect(state.owner_discord_id).toBeNull();
+      } finally {
+        await removeValidationPause(fixture);
+      }
     });
   });
 });

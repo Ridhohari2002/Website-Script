@@ -16,9 +16,10 @@ import { executorActivateSchema, executorValidateSchema } from "@/validators/exe
  *
  * Rate limiting is split by trust boundary:
  * - The route applies an IP bucket before body parsing and before any database
- *   work. `x-forwarded-for`/`x-real-ip` are trusted only behind the deployment's
- *   reverse proxy; without that proxy they are client-controlled, which is why
- *   the IP bucket is a coarse abuse guard, never an authorization decision.
+ *   work, but only when the request carries the configured trusted-proxy marker
+ *   and exactly one valid forwarded address. Without that proof the IP bucket is
+ *   omitted rather than collapsing every client into one "unknown" bucket. The
+ *   IP bucket is a coarse abuse guard, never an authorization decision.
  * - Per-key and per-session buckets are applied inside the executor service,
  *   after the key or session has been identified through its server-side HMAC
  *   hash. Client headers such as `x-key-fingerprint` are ignored entirely.
@@ -30,14 +31,12 @@ const VALIDATE_IP_LIMIT = 240;
 const REVOKE_IP_LIMIT = 60;
 
 function ipDimension(context: RouteContext, limit: number): RateLimitDimension[] {
-  return [
-    {
-      kind: "ip",
-      value: clientIp(context.request) ?? "unknown",
-      limit,
-      windowSeconds: WINDOW_SECONDS,
-    },
-  ];
+  const ip = clientIp(context.request);
+  // No verified proxy marker means no trustworthy IP. Returning no dimension is
+  // deliberate: a shared "unknown" bucket would treat an unlimited set of
+  // clients as if they were one rate-limited identity.
+  if (!ip) return [];
+  return [{ kind: "ip", value: ip, limit, windowSeconds: WINDOW_SECONDS }];
 }
 
 const idSchema = z.string().uuid();

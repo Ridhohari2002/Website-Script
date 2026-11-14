@@ -20,19 +20,19 @@ const LOGIN_IP_LIMIT = 20;
 const CALLBACK_IP_LIMIT = 30;
 const SESSION_ID = z.string().uuid();
 
+function ipDimensions(request: Request, limit: number) {
+  const ip = clientIp(request);
+  // No verified proxy marker means no trustworthy IP; omit the bucket instead
+  // of pretending all clients share one identity.
+  return ip ? [{ kind: "ip" as const, value: ip, limit, windowSeconds: AUTH_WINDOW_SECONDS }] : [];
+}
+
 export function authRoutes(service: AuthService): RouteDefinition[] {
   return [
     {
       method: "GET",
       pattern: ["auth", "login"],
-      rateLimit: ({ request }) => [
-        {
-          kind: "ip",
-          value: clientIp(request) ?? "unknown",
-          limit: LOGIN_IP_LIMIT,
-          windowSeconds: AUTH_WINDOW_SECONDS,
-        },
-      ],
+      rateLimit: ({ request }) => ipDimensions(request, LOGIN_IP_LIMIT),
       async handler({ request, requestId }) {
         const next = new URL(request.url).searchParams.get("next");
         try {
@@ -49,14 +49,7 @@ export function authRoutes(service: AuthService): RouteDefinition[] {
     {
       method: "GET",
       pattern: ["auth", "callback"],
-      rateLimit: ({ request }) => [
-        {
-          kind: "ip",
-          value: clientIp(request) ?? "unknown",
-          limit: CALLBACK_IP_LIMIT,
-          windowSeconds: AUTH_WINDOW_SECONDS,
-        },
-      ],
+      rateLimit: ({ request }) => ipDimensions(request, CALLBACK_IP_LIMIT),
       async handler({ request, requestId }) {
         const url = new URL(request.url);
         const result = await service.completeLogin({

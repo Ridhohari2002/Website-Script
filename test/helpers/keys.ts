@@ -4,6 +4,7 @@ import type { RateLimitDecision, RateLimitDimension, RateLimiter } from "@/db/ra
 import type { TestDatabase } from "./db";
 import { createTestDatabase } from "./db";
 import { FakeClock } from "./auth";
+import { trustedProxyHeaders } from "./proxy";
 import { createKeyService, type KeyService } from "@/modules/keys/service";
 import { createExecutorService, type ExecutorService } from "@/modules/executor/service";
 
@@ -130,7 +131,7 @@ export function requestFor(path = "/api/keys/test"): Request {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-forwarded-for": "203.0.113.10",
+      ...trustedProxyHeaders("203.0.113.10"),
       "user-agent": "vitest",
     },
   });

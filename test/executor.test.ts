@@ -13,6 +13,7 @@ import {
   TEST_HWID_SECRET,
   type KeyHarness,
 } from "./helpers/keys";
+import { trustedProxyHeaders } from "./helpers/proxy";
 
 afterAll(() => resetEnvCache());
 
@@ -95,7 +96,7 @@ function executorRequest(): Request {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-forwarded-for": "198.51.100.7",
+      ...trustedProxyHeaders("198.51.100.7"),
       "user-agent": "executor-test",
     },
   });

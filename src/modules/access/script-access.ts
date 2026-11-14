@@ -68,16 +68,19 @@ export async function resolveScriptAccess(
       where s.public_id = $1
         and s.status = 'published'
         and s.enabled = true
-        and s.deleted_at is null`,
+        and s.deleted_at is null
+      for share of s`,
     [input.publicId],
   );
   const script = scriptResult.rows[0];
   if (!script) return { ok: false, code: "script_not_found" };
 
-  // Share-lock the entitlement rows so a concurrent revocation or suspension
-  // cannot commit between this read and the grant. Every caller locks the key
-  // row first; this lock is only ever taken after that, so entitlement writes
-  // cannot invert the keys -> executor_sessions order.
+  // Share-lock every row that contributes to eligibility, not just the
+  // entitlement. A concurrent revocation, product deactivation, or mapping
+  // removal must either commit before this read (and be observed) or wait for
+  // this transaction to finish. Every caller locks the key row first, so these
+  // locks are only ever taken after that and cannot invert the
+  // keys -> executor_sessions order.
   const entitlements = await db.query<EntitlementRow>(
     `select ke.id, ke.product_id, ke.status, ke.starts_at, ke.expires_at, p.active as product_active
        from key_entitlements ke
@@ -85,7 +88,7 @@ export async function resolveScriptAccess(
        join product_scripts ps on ps.product_id = ke.product_id and ps.script_id = $2
       where ke.key_id = $1
       order by ke.created_at desc, ke.id desc
-      for share of ke`,
+      for share of ke, p, ps`,
     [input.keyId, script.scriptId],
   );
 

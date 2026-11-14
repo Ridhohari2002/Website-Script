@@ -31,6 +31,7 @@ import {
   TEST_KEY_SESSION_SECRET,
 } from "../helpers/keys";
 import { createPgTestDatabase, type PgTestDatabase } from "../helpers/pg-db";
+import { trustedProxyHeaders } from "../helpers/proxy";
 
 /**
  * Phase 6 route-level integration suite.
@@ -239,7 +240,11 @@ interface ApiOptions {
 }
 
 async function api(handler: Handler, path: string, options: ApiOptions = {}): Promise<Response> {
-  const headers: Record<string, string> = { "user-agent": BROWSER_UA, ...options.headers };
+  const headers: Record<string, string> = {
+    "user-agent": BROWSER_UA,
+    ...trustedProxyHeaders("203.0.113.10"),
+    ...options.headers,
+  };
   if (options.cookie) headers.cookie = options.cookie;
   if (options.csrf) headers["x-csrf-token"] = options.csrf;
   if (options.origin) headers.origin = options.origin;

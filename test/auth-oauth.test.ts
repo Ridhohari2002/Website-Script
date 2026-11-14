@@ -11,6 +11,7 @@ import {
   TEST_SESSION_SECRET,
   type MockDiscordOptions,
 } from "./helpers/auth";
+import { trustedProxyHeaders } from "./helpers/proxy";
 
 function callbackFor(state: string, options: { code?: string; cookieState?: string } = {}) {
   const code = options.code ?? "test-authorization-code";
@@ -22,7 +23,7 @@ function callbackFor(state: string, options: { code?: string; cookieState?: stri
         headers: {
           cookie: `${OAUTH_STATE_COOKIE}=${cookieState}`,
           "user-agent": "vitest",
-          "x-forwarded-for": "203.0.113.9",
+          ...trustedProxyHeaders("203.0.113.9"),
         },
       },
     ),
