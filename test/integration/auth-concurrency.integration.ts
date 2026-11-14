@@ -1,16 +1,13 @@
 import { randomInt, randomUUID } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { createLogger } from "@/core/logger";
 import type { Db } from "@/db/client";
 import { MAX_ACTIVE_SESSIONS, OAUTH_STATE_COOKIE, SESSION_COOKIE } from "@/modules/auth/config";
 import { hashOAuthState } from "@/modules/auth/crypto";
 import { createAuthService } from "@/modules/auth/service";
 import type { DiscordOAuthClient } from "@/providers/discord/client";
-import {
-  CONCURRENCY_TEST_DATABASE_ENV,
-  createPgTestDatabase,
-  type PgTestDatabase,
-} from "../helpers/pg-db";
+import { resolveSafeTestDatabase } from "../../scripts/test-database-guard";
+import { createPgTestDatabase, type PgTestDatabase } from "../helpers/pg-db";
 
 /**
  * Real PostgreSQL concurrency test.
@@ -144,9 +141,11 @@ async function cleanup(db: Db, discordId: string, stateHashes: readonly string[]
   }
 }
 
-const HAS_TEST_DATABASE = Boolean(process.env[CONCURRENCY_TEST_DATABASE_ENV]?.trim());
+describe("real PostgreSQL session-cap concurrency", () => {
+  beforeAll(() => {
+    resolveSafeTestDatabase();
+  });
 
-describe.skipIf(!HAS_TEST_DATABASE)("real PostgreSQL session-cap concurrency", () => {
   it(
     "never exceeds five active sessions under concurrent completeLogin calls",
     { timeout: 60_000 },
@@ -254,9 +253,12 @@ describe.skipIf(!HAS_TEST_DATABASE)("real PostgreSQL session-cap concurrency", (
         );
         expect(revoked.rows[0]!.count).toBe(loginCount - MAX_ACTIVE_SESSIONS);
 
-        // The fixed clock makes every created_at identical, so this directly
-        // proves the id-ascending tie-breaker: the first three rows in
-        // (created_at, id) order must be the revoked ones.
+        // The fixed clock makes every created_at identical, so eviction is
+        // decided purely by the id-ascending tie-breaker. Concurrent logins
+        // commit in a nondeterministic order, and each one evicts the oldest
+        // active row *before* inserting its own session, so the final revoked
+        // set is not simply a prefix of the final (created_at, id) order. The
+        // tie-breaker is proven deterministically by the extra login below.
         const ordered = await database.db.query<{
           id: string;
           created_at: Date;
@@ -264,18 +266,15 @@ describe.skipIf(!HAS_TEST_DATABASE)("real PostgreSQL session-cap concurrency", (
         }>(
           `select id, created_at, revoked_at
              from sessions
-            where user_id = $1
-            order by created_at asc, id asc`,
+             where user_id = $1
+             order by created_at asc, id asc`,
           [userId],
         );
         expect(ordered.rows).toHaveLength(loginCount);
         expect(new Set(ordered.rows.map((row) => row.created_at.getTime())).size).toBe(1);
-        expect(
-          ordered.rows.slice(0, loginCount - MAX_ACTIVE_SESSIONS).every((row) => row.revoked_at),
-        ).toBe(true);
-        expect(
-          ordered.rows.slice(loginCount - MAX_ACTIVE_SESSIONS).every((row) => !row.revoked_at),
-        ).toBe(true);
+        expect(ordered.rows.filter((row) => row.revoked_at)).toHaveLength(
+          loginCount - MAX_ACTIVE_SESSIONS,
+        );
 
         const loginAudit = await database.db.query<{ count: number }>(
           `select count(*)::int as count
@@ -328,6 +327,54 @@ describe.skipIf(!HAS_TEST_DATABASE)("real PostgreSQL session-cap concurrency", (
         expect(accepted).toBe(MAX_ACTIVE_SESSIONS);
         expect(rejected).toBe(loginCount - MAX_ACTIVE_SESSIONS);
         expect(logs).toEqual([]);
+
+        // Deterministic proof of the (created_at, id) tie-breaker: every row
+        // shares the fixed created_at, so the next login must revoke exactly
+        // the smallest-id active session and leave the cap intact.
+        const beforeExtra = await database.db.query<{ id: string }>(
+          `select id
+             from sessions
+            where user_id = $1
+              and revoked_at is null
+              and expires_at > $2
+              and (absolute_expires_at is null or absolute_expires_at > $2)
+            order by created_at asc, id asc`,
+          [userId, FIXED_NOW.toISOString()],
+        );
+        expect(beforeExtra.rows).toHaveLength(MAX_ACTIVE_SESSIONS);
+        const expectedVictim = beforeExtra.rows[0]!.id;
+
+        const extraStart = await service.startLogin({ next: "/dashboard" });
+        const extraState = cookieValue(extraStart.cookies, OAUTH_STATE_COOKIE);
+        if (!extraState) throw new Error("extra startLogin did not return an OAuth state");
+        const extraRequest = new Request(
+          `${BASE}/api/auth/callback?code=extra&state=${encodeURIComponent(extraState)}`,
+          {
+            headers: {
+              cookie: `${OAUTH_STATE_COOKIE}=${extraState}`,
+              "user-agent": BROWSER_USER_AGENT,
+            },
+          },
+        );
+        attempts.push({ state: extraState, request: extraRequest });
+
+        const extraLogin = await service.completeLogin({
+          request: extraRequest,
+          code: "extra",
+          state: extraState,
+          oauthError: null,
+        });
+        expect(extraLogin.ok).toBe(true);
+
+        const afterExtra = await database.db.query<{ id: string; revoked_at: Date | null }>(
+          "select id, revoked_at from sessions where user_id = $1",
+          [userId],
+        );
+        expect(afterExtra.rows).toHaveLength(loginCount + 1);
+        expect(afterExtra.rows.find((row) => row.id === expectedVictim)?.revoked_at).not.toBeNull();
+        expect(afterExtra.rows.filter((row) => row.revoked_at === null)).toHaveLength(
+          MAX_ACTIVE_SESSIONS,
+        );
       } catch (error) {
         primaryError = error;
         throw error;

@@ -14,6 +14,8 @@ export interface RunMigrationsOptions {
   applicationName: string;
   /** When set, the connected database must match exactly before any write. */
   expectedDatabaseName?: string;
+  /** When set, the connected role must match exactly before any write. */
+  expectedUserName?: string;
   migrationsDir?: string;
   log?: (line: string) => void;
 }
@@ -44,12 +46,20 @@ export async function runMigrations(options: RunMigrationsOptions): Promise<RunM
   await client.connect();
 
   try {
-    if (options.expectedDatabaseName) {
-      const current = await client.query<{ name: string }>("select current_database() as name");
-      const name = current.rows[0]?.name;
-      if (name !== options.expectedDatabaseName) {
+    if (options.expectedDatabaseName || options.expectedUserName) {
+      const current = await client.query<{ database: string; user: string }>(
+        "select current_database() as database, current_user as user",
+      );
+      const row = current.rows[0];
+      if (!row) throw new Error("Refusing migrations: could not verify the connection target.");
+      if (options.expectedDatabaseName && row.database !== options.expectedDatabaseName) {
         throw new Error(
-          `Refusing migrations: connected database "${name ?? "unknown"}" is not "${options.expectedDatabaseName}"`,
+          `Refusing migrations: connected database "${row.database}" is not "${options.expectedDatabaseName}"`,
+        );
+      }
+      if (options.expectedUserName && row.user !== options.expectedUserName) {
+        throw new Error(
+          `Refusing migrations: connected role "${row.user}" is not "${options.expectedUserName}"`,
         );
       }
     }

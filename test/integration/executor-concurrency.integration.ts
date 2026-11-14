@@ -1,39 +1,42 @@
 import { randomInt, randomUUID } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import type { Client } from "pg";
+import { beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "@/db/client";
 import { createPlaintextKey, hashKeyValue } from "@/modules/keys/crypto";
 import { hashHwid } from "@/core/crypto/hwid";
 import { createExecutorService, type ExecutorService } from "@/modules/executor/service";
 import { AppError } from "@/core/errors";
+import { resolveSafeTestDatabase } from "../../scripts/test-database-guard";
 import {
-  CONCURRENCY_TEST_DATABASE_ENV,
+  createPgTestClient,
   createPgTestDatabase,
+  TEST_SERVICE_APPLICATION_NAME,
   type PgTestDatabase,
 } from "../helpers/pg-db";
 import { createTestRateLimiter } from "../helpers/keys";
 
 /**
- * Real PostgreSQL proof for executor-first locking, nonce consumption, and
- * session uniqueness.
+ * Deterministic real-PostgreSQL concurrency tests.
  *
- * The PGlite suite serializes transactions, so it cannot show row-lock
- * contention. This file is excluded from `npm test` and runs only through
- * `npm run test:integration:concurrency` against the dedicated
- * `boyfinity_concurrency_test` database.
+ * Every interleaving is controlled by row locks held on separate PostgreSQL
+ * connections and by polling pg_stat_activity/pg_locks until the expected
+ * backend is actually waiting on the expected relation. Promise.all() alone is
+ * not treated as proof of concurrency.
  */
 
-const HAS_TEST_DATABASE = Boolean(process.env[CONCURRENCY_TEST_DATABASE_ENV]?.trim());
 const KEY_SECRET = "concurrency-key-secret-0123456789";
 const SESSION_SECRET = "concurrency-session-secret-0123456789";
 const HWID_SECRET = "concurrency-hwid-secret-0123456789";
 const HWID = "abcdef123456";
 const OTHER_HWID = "111111111111";
-const ITERATIONS = 5;
 
-interface FixtureOptions {
-  /** Simulate a key already claimed through the Discord flow. */
-  legacyAuthorized?: boolean;
-}
+const BLOCKER_APP = "boyfinity-concurrency-test-blocker";
+const OLD_ORDER_A_APP = "boyfinity-concurrency-test-old-order-a";
+const OLD_ORDER_B_APP = "boyfinity-concurrency-test-old-order-b";
+const TRACKED_APPS = [TEST_SERVICE_APPLICATION_NAME, BLOCKER_APP, OLD_ORDER_A_APP, OLD_ORDER_B_APP];
+
+const WAIT_TIMEOUT_MS = 8_000;
+const OPERATION_TIMEOUT_MS = 20_000;
 
 interface Fixture {
   database: PgTestDatabase;
@@ -45,6 +48,25 @@ interface Fixture {
   userId: string;
   ownerDiscordId: string;
   productId: string;
+}
+
+interface FixtureOptions {
+  /** Simulate a key already claimed through the Discord flow. */
+  legacyAuthorized?: boolean;
+}
+
+interface LockWaiter {
+  pid: number;
+  query: string;
+  /** Relation named by the waiting statement; row-lock waits themselves are transactionid waits. */
+  relation: string | null;
+  blockers: number[];
+}
+
+interface BlockerContext {
+  client: Client;
+  pid: number;
+  release: (mode?: "commit" | "rollback") => Promise<void>;
 }
 
 function discordId(): string {
@@ -60,6 +82,45 @@ function request(path: string): Request {
       "user-agent": "executor-concurrency-test",
     },
   });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Timed out after ${OPERATION_TIMEOUT_MS}ms: ${label}`)),
+      OPERATION_TIMEOUT_MS,
+    );
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (error instanceof AppError) return error.code;
+  if (error && typeof error === "object" && "code" in error) {
+    const code = (error as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
+}
+
+/** Marks a launched operation as handled even if a failed assertion abandons it. */
+function tracked<T>(promise: Promise<T>): Promise<T> {
+  void promise.catch(() => undefined);
+  return promise;
+}
+
+async function backendPid(client: Client): Promise<number> {
+  const result = await client.query<{ pid: number }>("select pg_backend_pid() as pid");
+  return result.rows[0]!.pid;
 }
 
 async function verifySchema(db: Db): Promise<void> {
@@ -78,8 +139,8 @@ async function verifySchema(db: Db): Promise<void> {
     }
   }
 
-  const columns = await db.query<{ table_name: string; column_name: string }>(
-    `select table_name, column_name
+  const columns = await db.query<{ column_name: string }>(
+    `select column_name
        from information_schema.columns
       where table_schema = 'public'
         and table_name = 'keys'
@@ -186,10 +247,34 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
   };
 }
 
+async function quiesceServiceBackends(fixture: Fixture): Promise<void> {
+  const { database } = fixture;
+  await database.db.query(
+    `select pg_terminate_backend(pid)
+       from pg_stat_activity
+      where application_name = $1
+        and pid <> pg_backend_pid()`,
+    [TEST_SERVICE_APPLICATION_NAME],
+  );
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const active = await database.db.query<{ count: number }>(
+      `select count(*)::int as count
+         from pg_stat_activity
+        where application_name = $1
+          and pid <> pg_backend_pid()`,
+      [TEST_SERVICE_APPLICATION_NAME],
+    );
+    if (active.rows[0]!.count === 0) return;
+    await delay(20);
+  }
+}
+
 async function cleanup(fixture: Fixture): Promise<void> {
   const { database, keyId, scriptId, userId, productId } = fixture;
-  // Delete only records created by this fixture. Shared tables are never
-  // truncated, and messages are ordered around the non-cascade references.
+  // Abandoned service transactions (from a failed assertion) must be closed
+  // before fixture-scoped deletes; otherwise they can still insert grants or
+  // hold row locks while cleanup runs.
+  await quiesceServiceBackends(fixture);
   await database.db.query("delete from script_access_logs where key_id = $1", [keyId]);
   await database.db.query("delete from audit_logs where target_id = $1", [keyId]);
   await database.db.query("delete from audit_logs where actor_user_id = $1", [userId]);
@@ -212,36 +297,48 @@ async function withFixture(
   }
 }
 
-function fulfilled<T>(result: PromiseSettledResult<T>): T {
-  if (result.status !== "fulfilled") throw result.reason;
-  return result.value;
-}
-
-function rejectedCode(result: PromiseSettledResult<unknown>): string {
-  expect(result.status).toBe("rejected");
-  const error = (result as PromiseRejectedResult).reason;
-  expect(error).toBeInstanceOf(AppError);
-  return (error as AppError).code;
-}
-
 async function activate(fixture: Fixture, hwid = HWID) {
-  return fixture.service.activate({
-    request: request("/api/executor/v1/activate"),
-    key: fixture.key,
-    hwid,
-    scriptId: fixture.scriptPublicId,
-  });
+  return tracked(
+    fixture.service.activate({
+      request: request("/api/executor/v1/activate"),
+      key: fixture.key,
+      hwid,
+      scriptId: fixture.scriptPublicId,
+    }),
+  );
 }
 
 async function validate(fixture: Fixture, sessionToken: string, nonce = randomUUID()) {
-  return fixture.service.validate({
-    request: request("/api/executor/v1/validate"),
-    sessionToken,
-    scriptId: fixture.scriptPublicId,
-    hwid: HWID,
-    timestamp: new Date().toISOString(),
-    nonce,
-  });
+  return tracked(
+    fixture.service.validate({
+      request: request("/api/executor/v1/validate"),
+      sessionToken,
+      scriptId: fixture.scriptPublicId,
+      hwid: HWID,
+      timestamp: new Date().toISOString(),
+      nonce,
+    }),
+  );
+}
+
+async function revoke(fixture: Fixture, sessionToken: string) {
+  return tracked(
+    fixture.service.revokeSession({
+      request: request("/api/executor/v1/revoke"),
+      sessionToken,
+    }),
+  );
+}
+
+async function adminRevoke(fixture: Fixture, sessionId: string) {
+  return tracked(
+    fixture.service.adminRevokeSession({
+      keyId: fixture.keyId,
+      sessionId,
+      adminUserId: fixture.userId,
+      request: request("/api/admin/executor/sessions/revoke"),
+    }),
+  );
 }
 
 async function activeSessionIds(fixture: Fixture): Promise<string[]> {
@@ -302,230 +399,727 @@ async function keyState(fixture: Fixture): Promise<{
   return rows.rows[0]!;
 }
 
-describe.skipIf(!HAS_TEST_DATABASE)("executor concurrency (real PostgreSQL)", () => {
-  it(`A. activation vs validation x${ITERATIONS}`, async () => {
-    for (let iteration = 0; iteration < ITERATIONS; iteration += 1) {
-      await withFixture({}, async (fixture) => {
-        const first = await activate(fixture);
-        const [secondActivation, validation] = await Promise.allSettled([
-          activate(fixture),
-          validate(fixture, first.sessionToken),
+const LOCK_TARGETS = ["executor_sessions", "key_entitlements", "keys"] as const;
+
+/**
+ * A row-lock wait shows up in pg_locks as an ungranted `transactionid` lock
+ * with no relation, so the relation must be read from the waiting statement.
+ * The statement text is the production SQL fragment, which names the table it
+ * is blocked on.
+ */
+function lockTarget(query: string): string | null {
+  const lower = query.toLowerCase();
+  for (const relation of LOCK_TARGETS) {
+    if (lower.includes(relation)) return relation;
+  }
+  return null;
+}
+
+async function readLockWaiters(db: Db): Promise<LockWaiter[]> {
+  const result = await db.query<{ pid: number; query: string; blockers: number[] }>(
+    `select a.pid,
+            a.query,
+            pg_blocking_pids(a.pid) as blockers
+       from pg_stat_activity a
+      where a.application_name = any($1::text[])
+        and a.wait_event_type = 'Lock'`,
+    [TRACKED_APPS],
+  );
+  return result.rows.map((row) => ({
+    pid: row.pid,
+    query: row.query,
+    blockers: row.blockers,
+    relation: lockTarget(row.query),
+  }));
+}
+
+async function waitForWaiter(
+  fixture: Fixture,
+  match: (waiter: LockWaiter) => boolean,
+  label: string,
+): Promise<LockWaiter> {
+  const deadline = Date.now() + WAIT_TIMEOUT_MS;
+  for (;;) {
+    const waiters = await readLockWaiters(fixture.database.db);
+    const found = waiters.find(match);
+    if (found) return found;
+    if (Date.now() >= deadline) {
+      const observed = waiters.map((waiter) => `${waiter.pid}:${waiter.relation ?? "?"}`);
+      throw new Error(
+        `Timed out waiting for ${label}. Observed lock waiters: ${observed.join(", ")}`,
+      );
+    }
+    await delay(20);
+  }
+}
+
+async function withBlocker(
+  fixture: Fixture,
+  work: (context: BlockerContext) => Promise<void>,
+): Promise<void> {
+  const client = await createPgTestClient(BLOCKER_APP);
+  let released = false;
+  try {
+    await client.query("begin");
+    const pid = await backendPid(client);
+    const release = async (mode: "commit" | "rollback" = "rollback"): Promise<void> => {
+      if (released) return;
+      await client.query(mode);
+      released = true;
+    };
+    await work({ client, pid, release });
+  } finally {
+    if (!released) {
+      try {
+        await client.query("rollback");
+      } catch {
+        // The test failure is the useful one.
+      }
+    }
+    await client.end();
+  }
+}
+
+async function assertNoDeadlock(results: PromiseSettledResult<unknown>[]): Promise<void> {
+  for (const result of results) {
+    if (result.status === "rejected") expect(errorCode(result.reason)).not.toBe("40P01");
+  }
+}
+
+function fulfilled<T>(result: PromiseSettledResult<T>): T {
+  if (result.status !== "fulfilled") throw result.reason;
+  return result.value;
+}
+
+function rejectedCode(result: PromiseSettledResult<unknown>): string {
+  expect(result.status).toBe("rejected");
+  return errorCode((result as PromiseRejectedResult).reason) ?? "";
+}
+
+describe("executor concurrency (deterministic real PostgreSQL)", () => {
+  beforeAll(() => {
+    resolveSafeTestDatabase();
+  });
+
+  it("A1. activation-first: validate waits behind the key holder, then sees the superseded session", async () => {
+    await withFixture({}, async (fixture) => {
+      const first = await activate(fixture);
+
+      await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+        await client.query("select id from executor_sessions where id = $1 for update", [
+          first.sessionId,
         ]);
 
-        const next = fulfilled(secondActivation);
-        if (validation.status === "fulfilled") {
-          // Validation held the key lock first and granted against the old
-          // session; activation then superseded it.
-          expect(fulfilled(validation).sessionId).toBe(first.sessionId);
-        } else {
-          expect(rejectedCode(validation)).toBe("session_revoked");
-        }
+        const activation = activate(fixture);
+        const activationWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes("update executor_sessions") &&
+            waiter.relation === "executor_sessions",
+          "activation waiting on the session row",
+        );
+        expect(activationWait.blockers).toContain(blockerPid);
+
+        const validation = validate(fixture, first.sessionToken);
+        const validationWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes("select * from keys where id = $1 for update") &&
+            waiter.relation === "keys",
+          "validation waiting on the key row",
+        );
+
+        // Different backend connections, and validation is behind activation's
+        // key lock rather than taking the session lock first.
+        expect(validationWait.pid).not.toBe(activationWait.pid);
+        expect(validationWait.blockers).toContain(activationWait.pid);
+        expect(validationWait.relation).not.toBe("executor_sessions");
+
+        await release();
+
+        const settled = await withTimeout(
+          Promise.allSettled([activation, validation]),
+          "activation-first settlement",
+        );
+        await assertNoDeadlock(settled);
+        const next = fulfilled(settled[0]!);
+        expect(rejectedCode(settled[1]!)).toBe("session_revoked");
 
         const active = await activeSessionIds(fixture);
-        expect(active).toHaveLength(1);
-        expect(active[0]).toBe(next.sessionId);
-        expect(await keyState(fixture)).toMatchObject({ activation_count: 1 });
+        expect(active).toEqual([next.sessionId]);
+        expect(await grantCount(fixture)).toBe(0);
+        expect(await nonceCount(fixture)).toBe(0);
       });
-    }
+    });
   });
 
-  it(`B. activation vs activation (same HWID) x${ITERATIONS}`, async () => {
-    for (let iteration = 0; iteration < ITERATIONS; iteration += 1) {
-      await withFixture({}, async (fixture) => {
-        const results = await Promise.allSettled([activate(fixture), activate(fixture)]);
-        expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+  it("A2. validate-first: validation commits against the old session, then activation replaces it", async () => {
+    await withFixture({}, async (fixture) => {
+      const first = await activate(fixture);
 
-        const state = await keyState(fixture);
-        expect(state.activation_count).toBe(1);
+      await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+        await client.query("select id from executor_sessions where id = $1 for update", [
+          first.sessionId,
+        ]);
+
+        const validation = validate(fixture, first.sessionToken);
+        const validationWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes(
+              "from executor_sessions where id = $1 and key_id = $2 for update",
+            ) && waiter.relation === "executor_sessions",
+          "validation waiting on the session row",
+        );
+        expect(validationWait.blockers).toContain(blockerPid);
+
+        const activation = activate(fixture);
+        const activationWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes("select * from keys where key_hash = any") &&
+            waiter.relation === "keys",
+          "activation waiting on the key row",
+        );
+        expect(activationWait.blockers).toContain(validationWait.pid);
+        expect(activationWait.pid).not.toBe(validationWait.pid);
+
+        await release();
+
+        const settled = await withTimeout(
+          Promise.allSettled([validation, activation]),
+          "validate-first settlement",
+        );
+        await assertNoDeadlock(settled);
+        expect(fulfilled(settled[0]!).sessionId).toBe(first.sessionId);
+        const next = fulfilled(settled[1]!);
+
+        expect(await activeSessionIds(fixture)).toEqual([next.sessionId]);
+        expect(await grantCount(fixture)).toBe(1);
+        expect(await nonceCount(fixture)).toBe(1);
+        expect(await sessionStatus(fixture, first.sessionId)).toBe("superseded");
+      });
+    });
+  });
+
+  it("B. simultaneous same-HWID activations queue on the key lock", async () => {
+    await withFixture({}, async (fixture) => {
+      await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+        await client.query("select id from keys where id = $1 for update", [fixture.keyId]);
+
+        const first = activate(fixture);
+        const firstWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes("select * from keys where key_hash = any") &&
+            waiter.relation === "keys",
+          "first activation waiting on the key row",
+        );
+        const second = activate(fixture);
+        const secondWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.pid !== firstWait.pid &&
+            waiter.query.includes("select * from keys where key_hash = any") &&
+            waiter.relation === "keys",
+          "second activation waiting on the key row",
+        );
+
+        expect(firstWait.blockers).toContain(blockerPid);
+        // The second waiter queues behind the first, so PostgreSQL reports the
+        // first waiter (a soft blocker) rather than the original holder.
+        expect(secondWait.blockers.some((pid) => pid === blockerPid || pid === firstWait.pid)).toBe(
+          true,
+        );
+        expect(firstWait.pid).not.toBe(secondWait.pid);
+
+        await release();
+
+        const settled = await withTimeout(
+          Promise.allSettled([first, second]),
+          "same-HWID activation settlement",
+        );
+        await assertNoDeadlock(settled);
+        expect(settled.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+
         expect(await activeSessionIds(fixture)).toHaveLength(1);
-
-        const sessions = await fixture.database.db.query<{ status: string; count: number }>(
-          `select status, count(*)::int as count
-             from executor_sessions where key_id = $1 group by status`,
+        expect((await keyState(fixture)).activation_count).toBe(1);
+        const sessions = await fixture.database.db.query<{ count: number }>(
+          "select count(*)::int as count from executor_sessions where key_id = $1",
           [fixture.keyId],
         );
-        expect(sessions.rows.find((row) => row.status === "active")?.count).toBe(1);
+        expect(sessions.rows[0]!.count).toBe(2);
       });
-    }
+    });
   });
 
-  it(`C. activation vs activation (different HWID) x${ITERATIONS}`, async () => {
-    for (let iteration = 0; iteration < ITERATIONS; iteration += 1) {
-      await withFixture({}, async (fixture) => {
-        const results = await Promise.allSettled([
-          activate(fixture, HWID),
-          activate(fixture, OTHER_HWID),
-        ]);
-        const succeeded = results.map((result) => result.status === "fulfilled");
+  it("C. simultaneous different-HWID activations keep the binding invariant", async () => {
+    await withFixture({}, async (fixture) => {
+      await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+        await client.query("select id from keys where id = $1 for update", [fixture.keyId]);
+
+        const first = activate(fixture, HWID);
+        const firstWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes("select * from keys where key_hash = any") &&
+            waiter.relation === "keys",
+          "first different-HWID activation waiting",
+        );
+        const second = activate(fixture, OTHER_HWID);
+        const secondWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.pid !== firstWait.pid &&
+            waiter.query.includes("select * from keys where key_hash = any") &&
+            waiter.relation === "keys",
+          "second different-HWID activation waiting",
+        );
+        expect(firstWait.blockers).toContain(blockerPid);
+        expect(secondWait.blockers.some((pid) => pid === blockerPid || pid === firstWait.pid)).toBe(
+          true,
+        );
+
+        await release();
+
+        const settled = await withTimeout(
+          Promise.allSettled([first, second]),
+          "different-HWID activation settlement",
+        );
+        await assertNoDeadlock(settled);
+        const succeeded = settled.map((result) => result.status === "fulfilled");
         expect(succeeded.filter(Boolean)).toHaveLength(1);
-        expect(rejectedCode(results.find((result) => result.status === "rejected")!)).toBe(
+        expect(rejectedCode(settled.find((result) => result.status === "rejected")!)).toBe(
           "hwid_mismatch",
         );
 
-        const expectedHwid = hashHwid(succeeded[0] ? HWID : OTHER_HWID, HWID_SECRET);
         const state = await keyState(fixture);
-        expect(state.bound_hwid_hash).toBe(expectedHwid);
+        expect(state.bound_hwid_hash).toBe(hashHwid(succeeded[0] ? HWID : OTHER_HWID, HWID_SECRET));
         expect(state.owner_discord_id).toBeNull();
         expect(await activeSessionIds(fixture)).toHaveLength(1);
       });
-    }
+    });
   });
 
-  it(`D. validation vs revoke x${ITERATIONS}`, async () => {
-    for (let iteration = 0; iteration < ITERATIONS; iteration += 1) {
-      await withFixture({}, async (fixture) => {
-        const activation = await activate(fixture);
-        const [validation, revocation] = await Promise.allSettled([
-          validate(fixture, activation.sessionToken),
-          fixture.service.revokeSession({
-            request: request("/api/executor/v1/revoke"),
-            sessionToken: activation.sessionToken,
-          }),
+  it("D1. validate-first vs revoke: grant commits, then revocation closes the session", async () => {
+    await withFixture({}, async (fixture) => {
+      const first = await activate(fixture);
+
+      await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+        await client.query("select id from executor_sessions where id = $1 for update", [
+          first.sessionId,
         ]);
 
-        const revoke = fulfilled(revocation);
-        expect(revoke.revoked).toBe(true);
-        expect(revoke.status).toBe("revoked");
-        expect(await sessionStatus(fixture, activation.sessionId)).toBe("revoked");
+        const validation = validate(fixture, first.sessionToken);
+        const validationWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes(
+              "from executor_sessions where id = $1 and key_id = $2 for update",
+            ) && waiter.relation === "executor_sessions",
+          "validation waiting on the session row",
+        );
+        expect(validationWait.blockers).toContain(blockerPid);
 
-        if (validation.status === "fulfilled") {
-          expect(await grantCount(fixture)).toBe(1);
-          expect(await nonceCount(fixture)).toBe(1);
-        } else {
-          expect(rejectedCode(validation)).toBe("session_revoked");
-          expect(await grantCount(fixture)).toBe(0);
-          expect(await nonceCount(fixture)).toBe(0);
-        }
+        const revocation = revoke(fixture, first.sessionToken);
+        const revokeWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.pid !== validationWait.pid &&
+            waiter.query.includes("select id from keys where id = $1 for update") &&
+            waiter.relation === "keys",
+          "revoke waiting on the key row",
+        );
+        expect(revokeWait.blockers).toContain(validationWait.pid);
+
+        await release();
+
+        const settled = await withTimeout(
+          Promise.allSettled([validation, revocation]),
+          "validate-first revoke settlement",
+        );
+        await assertNoDeadlock(settled);
+        expect(fulfilled(settled[0]!).sessionId).toBe(first.sessionId);
+        expect(fulfilled(settled[1]!).revoked).toBe(true);
+
+        expect(await sessionStatus(fixture, first.sessionId)).toBe("revoked");
+        expect(await grantCount(fixture)).toBe(1);
+        expect(await nonceCount(fixture)).toBe(1);
         expect(await auditCount(fixture, "executor.session_revoke")).toBe(1);
-
-        // A revoked session never receives a new grant.
-        await expect(validate(fixture, activation.sessionToken)).rejects.toMatchObject({
-          code: expect.stringMatching(/session_revoked|session_required/),
-        });
       });
-    }
+    });
   });
 
-  it(`E. admin revoke vs activation x${ITERATIONS}`, async () => {
-    for (let iteration = 0; iteration < ITERATIONS; iteration += 1) {
-      await withFixture({ legacyAuthorized: true }, async (fixture) => {
-        const first = await activate(fixture);
-        const [adminRevoke, activation] = await Promise.allSettled([
-          fixture.service.adminRevokeSession({
-            keyId: fixture.keyId,
-            sessionId: first.sessionId,
-            adminUserId: fixture.userId,
-            request: request("/api/admin/executor/sessions/revoke"),
-          }),
-          activate(fixture),
+  it("D2. revoke-first vs validate: the revoked session never receives a grant", async () => {
+    await withFixture({}, async (fixture) => {
+      const first = await activate(fixture);
+
+      await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+        await client.query("select id from executor_sessions where id = $1 for update", [
+          first.sessionId,
         ]);
 
-        const admin = fulfilled(adminRevoke);
-        expect(["revoked", "superseded"]).toContain(admin.outcome);
-        const next = fulfilled(activation);
+        const revocation = revoke(fixture, first.sessionToken);
+        const revokeWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes(
+              "from executor_sessions where id = $1 and key_id = $2 for update",
+            ) && waiter.relation === "executor_sessions",
+          "revoke waiting on the session row",
+        );
+        expect(revokeWait.blockers).toContain(blockerPid);
 
-        const active = await activeSessionIds(fixture);
-        expect(active).toHaveLength(1);
-        expect(active[0]).toBe(next.sessionId);
+        const validation = validate(fixture, first.sessionToken);
+        const validationWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.pid !== revokeWait.pid &&
+            waiter.query.includes("select * from keys where id = $1 for update") &&
+            waiter.relation === "keys",
+          "validation waiting on the key row",
+        );
+        expect(validationWait.blockers).toContain(revokeWait.pid);
 
-        // Buyer identity is never rewritten by activation or admin revoke.
+        await release();
+
+        const settled = await withTimeout(
+          Promise.allSettled([revocation, validation]),
+          "revoke-first settlement",
+        );
+        await assertNoDeadlock(settled);
+        expect(fulfilled(settled[0]!).revoked).toBe(true);
+        expect(rejectedCode(settled[1]!)).toBe("session_revoked");
+
+        expect(await sessionStatus(fixture, first.sessionId)).toBe("revoked");
+        expect(await grantCount(fixture)).toBe(0);
+        expect(await nonceCount(fixture)).toBe(0);
+        expect(await auditCount(fixture, "executor.session_revoke")).toBe(1);
+      });
+    });
+  });
+
+  it("E1. admin revoke-first vs activation: the revoked session is replaced by one active session", async () => {
+    await withFixture({ legacyAuthorized: true }, async (fixture) => {
+      const first = await activate(fixture);
+
+      await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+        await client.query("select id from executor_sessions where id = $1 for update", [
+          first.sessionId,
+        ]);
+
+        const admin = adminRevoke(fixture, first.sessionId);
+        const adminWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes(
+              "from executor_sessions where id = $1 and key_id = $2 for update",
+            ) && waiter.relation === "executor_sessions",
+          "admin revoke waiting on the session row",
+        );
+        expect(adminWait.blockers).toContain(blockerPid);
+
+        const activation = activate(fixture);
+        const activationWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes("select * from keys where key_hash = any") &&
+            waiter.relation === "keys",
+          "activation waiting on the key row",
+        );
+        expect(activationWait.blockers).toContain(adminWait.pid);
+
+        await release();
+
+        const settled = await withTimeout(
+          Promise.allSettled([admin, activation]),
+          "admin-first settlement",
+        );
+        await assertNoDeadlock(settled);
+        expect(fulfilled(settled[0]!).outcome).toBe("revoked");
+        const next = fulfilled(settled[1]!);
+
+        expect(await activeSessionIds(fixture)).toEqual([next.sessionId]);
         const state = await keyState(fixture);
         expect(state.owner_discord_id).toBe(fixture.ownerDiscordId);
         expect(state.user_id).toBe(fixture.userId);
         expect(state.activation_count).toBe(0);
+        expect(await auditCount(fixture, "executor.session_revoke_admin")).toBe(1);
       });
-    }
+    });
   });
 
-  it(`F. entitlement revocation vs validation x${ITERATIONS}`, async () => {
-    for (let iteration = 0; iteration < ITERATIONS; iteration += 1) {
-      await withFixture({}, async (fixture) => {
-        const activation = await activate(fixture);
-        const revocation = fixture.database.db.transaction(async (tx) => {
-          await tx.query("update key_entitlements set status = 'revoked' where key_id = $1", [
-            fixture.keyId,
-          ]);
-          return new Date();
-        });
+  it("E2. activation-first vs admin revoke: admin sees the superseded state and writes no false revocation", async () => {
+    await withFixture({ legacyAuthorized: true }, async (fixture) => {
+      const first = await activate(fixture);
 
-        const [validation, revokedAt] = await Promise.allSettled([
-          validate(fixture, activation.sessionToken),
-          revocation,
+      await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+        await client.query("select id from executor_sessions where id = $1 for update", [
+          first.sessionId,
         ]);
-        const revokedCommittedAt = fulfilled(revokedAt);
+
+        const activation = activate(fixture);
+        const activationWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes("update executor_sessions") &&
+            waiter.relation === "executor_sessions",
+          "activation waiting on the active session row",
+        );
+        expect(activationWait.blockers).toContain(blockerPid);
+
+        const admin = adminRevoke(fixture, first.sessionId);
+        const adminWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.pid !== activationWait.pid &&
+            waiter.query.includes("select id from keys where id = $1 for update") &&
+            waiter.relation === "keys",
+          "admin revoke waiting on the key row",
+        );
+        expect(adminWait.blockers).toContain(activationWait.pid);
+
+        await release();
+
+        const settled = await withTimeout(
+          Promise.allSettled([activation, admin]),
+          "activation-first admin settlement",
+        );
+        await assertNoDeadlock(settled);
+        const next = fulfilled(settled[0]!);
+        expect(fulfilled(settled[1]!).outcome).toBe("superseded");
+
+        expect(await activeSessionIds(fixture)).toEqual([next.sessionId]);
+        expect(await sessionStatus(fixture, first.sessionId)).toBe("superseded");
+        expect(await auditCount(fixture, "executor.session_revoke_admin")).toBe(0);
+        const state = await keyState(fixture);
+        expect(state.owner_discord_id).toBe(fixture.ownerDiscordId);
+        expect(state.user_id).toBe(fixture.userId);
+      });
+    });
+  });
+
+  it("F. in-flight entitlement revocation blocks validation until its own lock resolves", async () => {
+    await withFixture({}, async (fixture) => {
+      const first = await activate(fixture);
+
+      await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+        await client.query("update key_entitlements set status = 'revoked' where key_id = $1", [
+          fixture.keyId,
+        ]);
+
+        const validation = validate(fixture, first.sessionToken);
+        const validationWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.relation === "key_entitlements" && waiter.blockers.includes(blockerPid),
+          "validation waiting on the entitlement share lock",
+        );
+        expect(validationWait.pid).not.toBe(blockerPid);
+
+        await release("commit");
+
+        const settled = await withTimeout(
+          Promise.allSettled([validation]),
+          "entitlement revocation settlement",
+        );
+        await assertNoDeadlock(settled);
+        expect(rejectedCode(settled[0]!)).toBe("entitlement_suspended");
 
         const entitlement = await fixture.database.db.query<{ status: string }>(
           "select status from key_entitlements where key_id = $1",
           [fixture.keyId],
         );
         expect(entitlement.rows[0]!.status).toBe("revoked");
+        expect(await grantCount(fixture)).toBe(0);
+        expect(await nonceCount(fixture)).toBe(0);
 
-        if (validation.status === "fulfilled") {
-          // The FOR SHARE lock forces the revocation to commit after the grant.
-          const grant = await fixture.database.db.query<{ created_at: Date }>(
-            `select created_at from script_access_logs
-              where key_id = $1 and result = 'granted'
-              order by created_at desc limit 1`,
-            [fixture.keyId],
-          );
-          expect(grant.rows).toHaveLength(1);
-          expect(grant.rows[0]!.created_at.getTime()).toBeLessThanOrEqual(
-            revokedCommittedAt.getTime(),
-          );
-        } else {
-          expect(rejectedCode(validation)).toBe("entitlement_suspended");
-          expect(await grantCount(fixture)).toBe(0);
-        }
-
-        // Once the revocation has committed, validation can never succeed.
-        await expect(validate(fixture, activation.sessionToken)).rejects.toMatchObject({
+        await expect(validate(fixture, first.sessionToken)).rejects.toMatchObject({
           code: "entitlement_suspended",
         });
       });
-    }
+    });
   });
 
-  it(`G. nonce replay x${ITERATIONS}`, async () => {
-    for (let iteration = 0; iteration < ITERATIONS; iteration += 1) {
-      await withFixture({}, async (fixture) => {
-        const activation = await activate(fixture);
-        const nonce = randomUUID();
-        const results = await Promise.allSettled([
-          validate(fixture, activation.sessionToken, nonce),
-          validate(fixture, activation.sessionToken, nonce),
-        ]);
+  it("G. parallel nonce replay: exactly one transaction consumes the nonce", async () => {
+    await withFixture({}, async (fixture) => {
+      const first = await activate(fixture);
+      const nonce = randomUUID();
 
-        expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
-        expect(rejectedCode(results.find((result) => result.status === "rejected")!)).toBe(
+      await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+        await client.query("select id from keys where id = $1 for update", [fixture.keyId]);
+
+        const one = validate(fixture, first.sessionToken, nonce);
+        const oneWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.query.includes("select * from keys where id = $1 for update") &&
+            waiter.relation === "keys",
+          "first nonce validation waiting on the key row",
+        );
+        const two = validate(fixture, first.sessionToken, nonce);
+        const twoWait = await waitForWaiter(
+          fixture,
+          (waiter) =>
+            waiter.pid !== oneWait.pid &&
+            waiter.query.includes("select * from keys where id = $1 for update") &&
+            waiter.relation === "keys",
+          "second nonce validation waiting on the key row",
+        );
+        expect(oneWait.blockers).toContain(blockerPid);
+        expect(twoWait.blockers.some((pid) => pid === blockerPid || pid === oneWait.pid)).toBe(
+          true,
+        );
+        expect(oneWait.pid).not.toBe(twoWait.pid);
+
+        await release();
+
+        const settled = await withTimeout(
+          Promise.allSettled([one, two]),
+          "nonce replay settlement",
+        );
+        await assertNoDeadlock(settled);
+        expect(settled.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+        expect(rejectedCode(settled.find((result) => result.status === "rejected")!)).toBe(
           "replay_detected",
         );
         expect(await nonceCount(fixture)).toBe(1);
         expect(await grantCount(fixture)).toBe(1);
       });
-    }
+    });
   });
 
-  it(`H. session uniqueness x${ITERATIONS}`, async () => {
-    for (let iteration = 0; iteration < ITERATIONS; iteration += 1) {
-      await withFixture({}, async (fixture) => {
-        const results = await Promise.allSettled([
-          activate(fixture),
-          activate(fixture),
-          activate(fixture),
-          activate(fixture),
-        ]);
-        expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+  it("H. four concurrent activations are serialized by one key lock and the unique index", async () => {
+    await withFixture({}, async (fixture) => {
+      await withBlocker(fixture, async ({ client, pid: blockerPid, release }) => {
+        await client.query("select id from keys where id = $1 for update", [fixture.keyId]);
 
-        const active = await activeSessionIds(fixture);
-        expect(active).toHaveLength(1);
+        const activations = [
+          activate(fixture),
+          activate(fixture),
+          activate(fixture),
+          activate(fixture),
+        ];
+        const waits: LockWaiter[] = [];
+        for (let index = 0; index < activations.length; index += 1) {
+          const waiter = await waitForWaiter(
+            fixture,
+            (candidate) =>
+              !waits.some((seen) => seen.pid === candidate.pid) &&
+              candidate.query.includes("select * from keys where key_hash = any") &&
+              candidate.relation === "keys",
+            `activation ${index + 1} waiting on the key row`,
+          );
+          waits.push(waiter);
+        }
+        // Every activation is queued behind the blocker or behind an earlier
+        // activation in the same lock queue; none is blocked by an unrelated
+        // session, which rules out a lock cycle.
+        expect(
+          waits.every((waiter) =>
+            waiter.blockers.some(
+              (pid) => pid === blockerPid || waits.some((other) => other.pid === pid),
+            ),
+          ),
+        ).toBe(true);
+        expect(new Set(waits.map((waiter) => waiter.pid)).size).toBe(4);
+
+        await release();
+
+        const settled = await withTimeout(
+          Promise.allSettled(activations),
+          "session uniqueness settlement",
+        );
+        await assertNoDeadlock(settled);
+        expect(settled.every((result) => result.status === "fulfilled")).toBe(true);
+
+        expect(await activeSessionIds(fixture)).toHaveLength(1);
         expect((await keyState(fixture)).activation_count).toBe(1);
-
-        const total = await fixture.database.db.query<{ count: number }>(
+        const sessions = await fixture.database.db.query<{ count: number }>(
           "select count(*)::int as count from executor_sessions where key_id = $1",
           [fixture.keyId],
         );
-        expect(total.rows[0]!.count).toBe(4);
+        expect(sessions.rows[0]!.count).toBe(4);
       });
-    }
+    });
+  });
+
+  it("I. the old session-first order deadlocks under controlled locks; the service order does not", async () => {
+    await withFixture({}, async (fixture) => {
+      const first = await activate(fixture);
+
+      const oldA = await createPgTestClient(OLD_ORDER_A_APP);
+      const oldB = await createPgTestClient(OLD_ORDER_B_APP);
+      let oldAPid: number | null = null;
+      let oldBPid: number | null = null;
+      let oldAWait: Promise<"resolved"> | null = null;
+      let oldBWait: Promise<"resolved"> | null = null;
+      try {
+        await oldA.query("begin");
+        await oldB.query("begin");
+        oldAPid = await backendPid(oldA);
+        oldBPid = await backendPid(oldB);
+        expect(oldAPid).not.toBe(oldBPid);
+
+        // Old order A: keys -> executor_sessions.
+        await oldA.query("select id from keys where id = $1 for update", [fixture.keyId]);
+        // Old order B: executor_sessions -> keys.
+        await oldB.query("select id from executor_sessions where id = $1 for update", [
+          first.sessionId,
+        ]);
+
+        oldAWait = tracked(
+          oldA
+            .query("select id from executor_sessions where id = $1 for update", [first.sessionId])
+            .then(() => "resolved" as const),
+        );
+        await waitForWaiter(
+          fixture,
+          (waiter) => waiter.pid === oldAPid && waiter.relation === "executor_sessions",
+          "old-order A waiting on the session row",
+        );
+
+        oldBWait = tracked(
+          oldB
+            .query("select id from keys where id = $1 for update", [fixture.keyId])
+            .then(() => "resolved" as const),
+        );
+
+        const settled = await withTimeout(
+          Promise.allSettled([oldAWait, oldBWait]),
+          "old-order deadlock reproduction",
+        );
+        const deadlocks = settled.filter(
+          (result) => result.status === "rejected" && errorCode(result.reason) === "40P01",
+        );
+        expect(deadlocks).toHaveLength(1);
+        expect(settled.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      } finally {
+        // A blocked query cannot be followed by ROLLBACK on the same client.
+        // Terminating the backend aborts its transaction and releases the row
+        // locks without waiting for the blocked statement.
+        if (oldAPid !== null) {
+          await fixture.database.db
+            .query("select pg_terminate_backend($1)", [oldAPid])
+            .catch(() => undefined);
+        }
+        if (oldBPid !== null) {
+          await fixture.database.db
+            .query("select pg_terminate_backend($1)", [oldBPid])
+            .catch(() => undefined);
+        }
+        await oldAWait?.catch(() => undefined);
+        await oldBWait?.catch(() => undefined);
+        await oldA.end().catch(() => undefined);
+        await oldB.end().catch(() => undefined);
+      }
+
+      // The controlled service regression is A1: activation holds keys and
+      // waits for the session row, while validation waits behind the key lock
+      // instead of taking the session lock first.
+      const state = await keyState(fixture);
+      expect(state.activation_count).toBe(1);
+      expect(await activeSessionIds(fixture)).toEqual([first.sessionId]);
+    });
   });
 });
