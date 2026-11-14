@@ -54,9 +54,6 @@ export function createApiHandler(
 
   return async function handle(request, path) {
     const startedAt = Date.now();
-    // Resolved lazily so `next build` page-data collection never needs runtime
-    // secrets. Production fails closed on the first request if they are absent.
-    const production = dependencies.production ?? isProduction();
     const requestId = resolveRequestId(request.headers);
     const requestLogger = logger.child({ requestId });
     const url = new URL(request.url);
@@ -65,6 +62,10 @@ export function createApiHandler(
     let response: Response;
 
     try {
+      // Resolved lazily so `next build` page-data collection never needs runtime
+      // secrets, and inside the pipeline so invalid production configuration is
+      // logged and mapped to the normal safe error response.
+      const production = dependencies.production ?? isProduction();
       const match = matchRoute(routes, request.method, path);
 
       if (match.kind === "not_found") {
