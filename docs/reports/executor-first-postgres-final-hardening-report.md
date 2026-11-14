@@ -23,7 +23,8 @@ New `scripts/test-database-guard.ts`, used by both `test/helpers/pg-db.ts` and `
 - Parses the URL instead of comparing strings, and normalizes host (lowercase, trailing dot, bracketed IPv6), default port, decoded database name, decoded username, and `sslmode`.
 - Requires a host, port, database, and username; refuses ambiguous targets.
 - Accepts only the test allowlist (`boyfinity_concurrency_test`); a name containing `test` is not sufficient.
-- Rejects wildcard hosts, production-like host segments (`prod`, `production`, `prd`, `live`), and a test host that matches a non-loopback HTTPS `APP_URL` host.
+- Accepts only explicitly allowlisted hosts (`localhost`, `127.0.0.1`, `::1`) after normalization; every other host, including wildcard addresses and production-looking names, is rejected (see section 5).
+- Rejects a test host that matches a non-loopback HTTPS `APP_URL` host as defense-in-depth.
 - Rejects a target whose normalized `(host, port, database)` identity equals `DATABASE_URL`, so differently formatted URLs that point at the application database are caught.
 - Refuses to proceed when `DATABASE_URL` or `APP_URL` is present but unparseable.
 - Never includes a password or a connection string in an error message.
@@ -78,21 +79,25 @@ Every scenario asserts distinct backend PIDs for the transactions that must inte
 
 ## 4. Test database safety guard cases
 
-`test/test-database-guard.test.ts` (13 tests, all passing) covers:
+`test/test-database-guard.test.ts` (17 tests, all passing) covers:
 
 - `TEST_DATABASE_URL` absent → fail closed with the variable name in the message.
 - Malformed URL → rejected.
 - Non-PostgreSQL protocol → rejected.
 - Database name outside the allowlist, including `*_test` names → rejected.
-- Production-like hosts (`db.prod.example.com`, `production.internal`, wildcard `0.0.0.0`) → rejected.
+- Exactly the three documented loopback hosts accepted (`localhost`, `127.0.0.1`, `::1`).
+- IPv6 bracket, hostname case, and trailing-dot normalization.
+- Arbitrary hostnames (`db.example.com`, `192.168.1.10`, `localhost.example.com`) → rejected.
+- Production-like hosts (`db.prod.example.com`, `production.internal`) → rejected.
+- Wildcard and unspecified addresses (`0.0.0.0`, `::`) → rejected.
 - `NODE_ENV=production` with an otherwise valid target → rejected.
-- Same normalized target as `DATABASE_URL` expressed in different URL formats (case, protocol, password, trailing `sslmode`) → rejected.
+- Same normalized target as `DATABASE_URL` expressed in different URL formats (case, protocol, password, port default, trailing `sslmode`) → rejected.
 - Same host/port with a different database name → allowed.
 - Unparseable `DATABASE_URL` → rejected as unverifiable.
-- Test host equal to a non-loopback HTTPS `APP_URL` host → rejected.
+- Unparseable `APP_URL` → rejected as unverifiable.
 - Valid target exposes normalized host, port, database, username, and SSL mode.
 - Missing username and unsupported `sslmode` → rejected.
-- Password never appears in an error message.
+- Password never appears in an error message, including for unapproved hosts.
 
 Manual fail-closed checks on `npm run db:migrate:test`:
 
@@ -102,7 +107,71 @@ Manual fail-closed checks on `npm run db:migrate:test`:
 
 `db:migrate:test` uses the same guard and verifies the connected database and role before applying migrations. It does not drop databases or schemas, does not truncate shared tables, and the integration suites delete only fixture-scoped rows.
 
-## 5. Auth concurrency test correction
+## 5. Test database host allowlist (final security closure)
+
+The final merge review found that the guard validated only the database name and rejected recognizable production hosts, so an arbitrary non-production-looking host (`db.example.com`, `192.168.1.10`) could still pass. The host check is now an explicit allowlist rather than a denylist.
+
+### Allowlist
+
+`TEST_DATABASE_HOST_ALLOWLIST` contains exactly:
+
+- `localhost`
+- `127.0.0.1`
+- `::1`
+
+A host must equal one of these after normalization. The guard lowercases, trims, strips one trailing dot, and removes IPv6 brackets; nothing else is accepted. There is no substring, suffix, or "looks non-production" heuristic, and the previous `prod`/`production`/`prd`/`live` segment scan and wildcard special case were removed because the allowlist subsumes them. Rejections use the `unapproved_host` safety code.
+
+### Accepted and rejected examples
+
+| Value | Result |
+|---|---|
+| `localhost` | accepted |
+| `LOCALHOST` | accepted, normalized to `localhost` |
+| `LocalHost.` | accepted, normalized to `localhost` |
+| `127.0.0.1` | accepted |
+| `[::1]` | accepted, normalized to `::1` |
+| `::1` | accepted |
+| `db.example.com` | rejected (`unapproved_host`) |
+| `localhost.example.com` | rejected (`unapproved_host`) |
+| `192.168.1.10` | rejected (`unapproved_host`) |
+| `db.prod.example.com` | rejected (`unapproved_host`) |
+| `production.internal` | rejected (`unapproved_host`) |
+| `0.0.0.0` | rejected (`unapproved_host`) |
+| `[::]` | rejected (`unapproved_host`) |
+
+The database-name allowlist (`boyfinity_concurrency_test`), the normalized `DATABASE_URL` identity comparison, the `NODE_ENV=production` rejection, and every fail-closed path are unchanged.
+
+### New unit tests
+
+The guard suite grew from 13 to 17 tests, adding:
+
+- Acceptance of exactly the three documented loopback hosts.
+- IPv6 bracket, case, and trailing-dot normalization.
+- Rejection of arbitrary hostnames, including a hostname that merely starts with `localhost`.
+- Rejection of wildcard and unspecified addresses.
+
+The existing same-database test now uses loopback hosts so it still reaches the normalized-identity comparison instead of stopping at the host check. The former "test host equals the APP_URL host" case is no longer reachable with a loopback-only allowlist, so it was replaced by a test that a malformed `APP_URL` still fails closed. The non-loopback comparison remains in the guard as defense-in-depth if the allowlist is ever deliberately expanded.
+
+### Verification results
+
+| Check | Result |
+|---|---|
+| `npm run typecheck` | PASS |
+| `npm run lint` | PASS |
+| `npm run format:check` | PASS |
+| `npm test` | PASS — 32 files, 334 tests |
+| `npm run test:integration:concurrency` | PASS — 2 files, 13 tests against real PostgreSQL |
+| `npm run build` | PASS — compiled successfully |
+
+The integration suite still connects only through `TEST_DATABASE_URL`, and the test migration runner uses the same guard; neither falls back to `DATABASE_URL`. The dedicated local PostgreSQL 18.6 cluster on `localhost` was used for the run.
+
+### Remaining limitations
+
+- A CI environment that needs a non-loopback PostgreSQL host cannot use the suite until the allowlist is extended. That requires a deliberate security review and a reviewed code change; it is not configurable through environment variables.
+- `localhost` resolves through the host resolver, so a compromised `/etc/hosts` or DNS configuration could still point it at another machine. The allowlist prevents configuration mistakes, not host-level compromise.
+- The allowlist applies to the database target only; it does not constrain the application runtime database.
+
+## 6. Auth concurrency test correction
 
 The existing `test/integration/auth-concurrency.integration.ts` became fail-closed, and one assertion was found to be incorrect rather than flaky.
 
@@ -115,7 +184,7 @@ The assertion is replaced with:
 
 The test passed six consecutive runs after the change.
 
-## 6. Verification
+## 7. Verification
 
 Command results on the feature branch:
 
@@ -124,8 +193,8 @@ Command results on the feature branch:
 | `npm run typecheck` | PASS |
 | `npm run lint` | PASS |
 | `npm run format:check` | PASS |
-| `npm test` | PASS — 32 files, 330 tests |
-| `npm run test:integration:concurrency` | PASS — 2 files, 13 tests; run three times consecutively with the same result |
+| `npm test` | PASS — 32 files, 334 tests |
+| `npm run test:integration:concurrency` | PASS — 2 files, 13 tests against real PostgreSQL |
 | `npm run build` | PASS — compiled successfully |
 
 Real PostgreSQL evidence:
@@ -134,13 +203,13 @@ Real PostgreSQL evidence:
 - `npm run db:migrate:test` applied `0001_init.sql`, `0002_executor_first.sql`, and `0003_executor_review_fixes.sql` to that database through the guard.
 - The concurrency tests were not run against PGlite or a mock, and no production database was contacted.
 
-## 7. Remaining risks
+## 8. Remaining risks
 
 - The wait detection reads the guarded relation from the waiting statement text. This is exact for the current production statements, which each name one table, but a future statement that joins `keys` and `executor_sessions` would make the derived relation ambiguous. Backend PIDs and `pg_blocking_pids()` remain authoritative regardless.
 - The old-order deadlock test relies on PostgreSQL's deadlock detector (default 1 s), so scenario I is slower than the others.
 - `pg_blocking_pids()` reports queued waiters as soft blockers. The assertions accept an earlier waiter as a valid blocker, which proves serialization but not which individual session is the hard blocker for queues deeper than two.
-- Applying migrations requires the allowlisted test database; running the integration suite therefore needs a provisioned PostgreSQL instance. When absent, the suite fails closed rather than skipping.
+- Applying migrations requires the allowlisted test database on an allowlisted loopback host; running the integration suite therefore needs a provisioned local PostgreSQL instance. When absent, the suite fails closed rather than skipping. A non-loopback CI database requires a reviewed allowlist change.
 
-## 8. Merge readiness
+## 9. Merge readiness
 
-The executor-first lock ordering (`keys` → `executor_sessions`), one active session per key, nonce replay protection, buyer identity, entitlement checks, and the `/api/executor/v1` contract are unchanged. This round only adds tests, the shared safety guard, and the guarded test migration entry point. With every verification command passing and the real-PostgreSQL suite stable across repeated runs, the branch is ready for final merge review.
+The executor-first lock ordering (`keys` → `executor_sessions`), one active session per key, nonce replay protection, buyer identity, entitlement checks, and the `/api/executor/v1` contract are unchanged. This round only adds tests, the shared safety guard with an explicit host allowlist, and the guarded test migration entry point. With every verification command passing and the real-PostgreSQL suite stable across repeated runs, the branch is ready for final merge review.

@@ -3,6 +3,7 @@ import {
   resolveSafeTestDatabase,
   TestDatabaseSafetyError,
   TEST_DATABASE_ENV,
+  TEST_DATABASE_HOST_ALLOWLIST,
   TEST_DATABASE_NAME,
 } from "../scripts/test-database-guard";
 
@@ -20,6 +21,13 @@ function expectSafetyCode(values: NodeJS.ProcessEnv, code: string): string {
     return safety.message;
   }
   throw new Error("expected the safety guard to reject the target");
+}
+
+function testUrl(host: string, port?: number): string {
+  const needsBrackets = host.includes(":") && !host.startsWith("[");
+  const authorityHost = needsBrackets ? `[${host}]` : host;
+  const authority = port === undefined ? authorityHost : `${authorityHost}:${port}`;
+  return `postgresql://user:pass@${authority}/${TEST_DATABASE_NAME}`;
 }
 
 describe("test database safety guard", () => {
@@ -50,26 +58,50 @@ describe("test database safety guard", () => {
     );
   });
 
+  it("allows exactly the documented loopback hosts", () => {
+    expect(TEST_DATABASE_HOST_ALLOWLIST).toEqual(["localhost", "127.0.0.1", "::1"]);
+    for (const host of TEST_DATABASE_HOST_ALLOWLIST) {
+      expect(resolveSafeTestDatabase(env({ TEST_DATABASE_URL: testUrl(host) })).host).toBe(host);
+    }
+  });
+
+  it("normalizes IPv6 brackets and case when matching the host allowlist", () => {
+    const bracketed = resolveSafeTestDatabase(env({ TEST_DATABASE_URL: testUrl("[::1]", 55432) }));
+    expect(bracketed.host).toBe("::1");
+    expect(bracketed.port).toBe(55432);
+
+    const uppercase = resolveSafeTestDatabase(env({ TEST_DATABASE_URL: testUrl("LOCALHOST") }));
+    expect(uppercase.host).toBe("localhost");
+
+    const trailingDot = resolveSafeTestDatabase(env({ TEST_DATABASE_URL: testUrl("LocalHost.") }));
+    expect(trailingDot.host).toBe("localhost");
+  });
+
+  it("rejects an arbitrary non-production hostname", () => {
+    expectSafetyCode(env({ TEST_DATABASE_URL: testUrl("db.example.com") }), "unapproved_host");
+    expectSafetyCode(env({ TEST_DATABASE_URL: testUrl("192.168.1.10") }), "unapproved_host");
+    expectSafetyCode(
+      env({ TEST_DATABASE_URL: testUrl("localhost.example.com") }),
+      "unapproved_host",
+    );
+  });
+
   it("rejects a production-like host", () => {
-    expectSafetyCode(
-      env({
-        TEST_DATABASE_URL: `postgresql://user:pass@db.prod.example.com/${TEST_DATABASE_NAME}`,
-      }),
-      "production_host",
-    );
-    expectSafetyCode(
-      env({
-        TEST_DATABASE_URL: `postgresql://user:pass@production.internal/${TEST_DATABASE_NAME}`,
-      }),
-      "production_host",
-    );
+    expectSafetyCode(env({ TEST_DATABASE_URL: testUrl("db.prod.example.com") }), "unapproved_host");
+    expectSafetyCode(env({ TEST_DATABASE_URL: testUrl("production.internal") }), "unapproved_host");
+  });
+
+  it("rejects wildcard and unspecified addresses", () => {
+    for (const host of ["0.0.0.0", "[::]"]) {
+      expectSafetyCode(env({ TEST_DATABASE_URL: testUrl(host) }), "unapproved_host");
+    }
   });
 
   it("rejects NODE_ENV=production even with an otherwise valid target", () => {
     expectSafetyCode(
       env({
         NODE_ENV: "production",
-        TEST_DATABASE_URL: `postgresql://user:pass@localhost/${TEST_DATABASE_NAME}`,
+        TEST_DATABASE_URL: testUrl("localhost"),
       }),
       "production_environment",
     );
@@ -78,8 +110,15 @@ describe("test database safety guard", () => {
   it("rejects the application database even when the URL format differs", () => {
     expectSafetyCode(
       env({
-        TEST_DATABASE_URL: `postgres://test:test-pass@DB.EXAMPLE.com:5432/${TEST_DATABASE_NAME}`,
-        DATABASE_URL: `postgresql://app:app-pass@db.example.com/${TEST_DATABASE_NAME}?sslmode=require`,
+        TEST_DATABASE_URL: `postgres://test:test-pass@127.0.0.1:5432/${TEST_DATABASE_NAME}`,
+        DATABASE_URL: `postgresql://app:app-pass@127.0.0.1/${TEST_DATABASE_NAME}?sslmode=require`,
+      }),
+      "same_as_application_database",
+    );
+    expectSafetyCode(
+      env({
+        TEST_DATABASE_URL: `postgres://test:test-pass@LOCALHOST:5432/${TEST_DATABASE_NAME}`,
+        DATABASE_URL: `postgresql://app:app-pass@localhost:5432/${TEST_DATABASE_NAME}`,
       }),
       "same_as_application_database",
     );
@@ -100,20 +139,20 @@ describe("test database safety guard", () => {
   it("fails closed when DATABASE_URL cannot be parsed", () => {
     expectSafetyCode(
       env({
-        TEST_DATABASE_URL: `postgresql://user:pass@localhost/${TEST_DATABASE_NAME}`,
+        TEST_DATABASE_URL: testUrl("localhost"),
         DATABASE_URL: "not-a-postgres-url",
       }),
       "unverifiable_database_url",
     );
   });
 
-  it("rejects a test host that is the production APP_URL host", () => {
+  it("fails closed when APP_URL cannot be parsed", () => {
     expectSafetyCode(
       env({
-        TEST_DATABASE_URL: `postgresql://user:pass@app.example.com/${TEST_DATABASE_NAME}`,
-        APP_URL: "https://app.example.com",
+        TEST_DATABASE_URL: testUrl("localhost"),
+        APP_URL: "not-a-url",
       }),
-      "production_host",
+      "unverifiable_app_url",
     );
   });
 
@@ -144,21 +183,17 @@ describe("test database safety guard", () => {
       }),
       "invalid_sslmode",
     );
-    expectSafetyCode(
-      env({ TEST_DATABASE_URL: `postgresql://user:pass@0.0.0.0/${TEST_DATABASE_NAME}` }),
-      "production_host",
-    );
   });
 
   it("never includes the password in an error message", () => {
     const password = "super-secret-test-password";
-    const message = expectSafetyCode(
-      env({
-        TEST_DATABASE_URL: `postgresql://app:${password}@db.prod.example.com/${TEST_DATABASE_NAME}`,
-      }),
-      "production_host",
-    );
-    expect(message).not.toContain(password);
-    expect(message).not.toContain("postgresql://");
+    for (const host of ["db.prod.example.com", "db.example.com"]) {
+      const message = expectSafetyCode(
+        env({ TEST_DATABASE_URL: `postgresql://app:${password}@${host}/${TEST_DATABASE_NAME}` }),
+        "unapproved_host",
+      );
+      expect(message).not.toContain(password);
+      expect(message).not.toContain("postgresql://");
+    }
   });
 });

@@ -2,15 +2,22 @@
  * Fail-closed safety guard for test-only database access.
  *
  * Both the integration tests and the test migration runner resolve their
- * connection through this module. It never falls back to DATABASE_URL, rejects
- * ambiguous targets, and compares normalized connection identities so two
- * differently formatted URLs that point at the same database cannot slip
- * through.
+ * connection through this module. It never falls back to DATABASE_URL, requires
+ * an explicitly allowlisted host and database name, rejects ambiguous targets,
+ * and compares normalized connection identities so two differently formatted
+ * URLs that point at the same database cannot slip through.
  */
 
 export const TEST_DATABASE_ENV = "TEST_DATABASE_URL";
 export const TEST_DATABASE_NAME = "boyfinity_concurrency_test";
 export const TEST_DATABASE_ALLOWLIST = [TEST_DATABASE_NAME] as const;
+
+/**
+ * Explicit host allowlist. A host must match one of these exactly after
+ * normalization; there is no suffix, substring, or "looks safe" heuristic.
+ * Non-loopback hosts require a deliberate security review and a code change.
+ */
+export const TEST_DATABASE_HOST_ALLOWLIST = ["localhost", "127.0.0.1", "::1"] as const;
 
 const DEFAULT_PORT = 5432;
 const ALLOWED_SSL_MODES = new Set([
@@ -22,9 +29,6 @@ const ALLOWED_SSL_MODES = new Set([
   "verify-full",
 ]);
 
-const PRODUCTION_HOST_SEGMENTS = new Set(["prod", "production", "prd", "live"]);
-const WILDCARD_HOSTS = new Set(["0.0.0.0", "::", "[::]"]);
-
 export type TestDatabaseSafetyCode =
   | "missing_test_url"
   | "malformed_url"
@@ -32,6 +36,7 @@ export type TestDatabaseSafetyCode =
   | "missing_identity"
   | "invalid_sslmode"
   | "unsafe_database_name"
+  | "unapproved_host"
   | "production_environment"
   | "production_host"
   | "unverifiable_database_url"
@@ -109,13 +114,12 @@ function parseConnection(raw: string, label: string): ParsedConnection {
   return { host, port, database, user, sslMode };
 }
 
-function assertNotProductionHost(host: string, label: string): void {
-  if (WILDCARD_HOSTS.has(host)) {
-    return fail("production_host", `${label} uses a wildcard or unspecified host.`);
-  }
-  const segments = host.split(/[.\-_]/);
-  if (segments.some((segment) => PRODUCTION_HOST_SEGMENTS.has(segment))) {
-    return fail("production_host", `${label} host looks like a production host.`);
+function assertAllowedHost(host: string, label: string): void {
+  if (!(TEST_DATABASE_HOST_ALLOWLIST as readonly string[]).includes(host)) {
+    fail(
+      "unapproved_host",
+      `${label} host "${host}" is not in the test host allowlist (${TEST_DATABASE_HOST_ALLOWLIST.join(", ")}).`,
+    );
   }
 }
 
@@ -152,7 +156,7 @@ export function resolveSafeTestDatabase(
     );
   }
 
-  assertNotProductionHost(target.host, TEST_DATABASE_ENV);
+  assertAllowedHost(target.host, TEST_DATABASE_ENV);
 
   const applicationUrl = source.DATABASE_URL?.trim();
   if (applicationUrl) {
