@@ -49,6 +49,7 @@ describe("environment loader", () => {
       KEY_HMAC_SECRET: "a-sufficiently-long-key-secret-value",
       SESSION_HMAC_SECRET: "a-sufficiently-long-session-secret-value",
       HWID_HASH_SECRET: "a-sufficiently-long-hwid-secret-value",
+      TRUSTED_PROXY_SECRET: "a-sufficiently-long-proxy-secret-value",
     } as unknown as NodeJS.ProcessEnv);
     expect(env.NODE_ENV).toBe("production");
   });
@@ -141,7 +142,7 @@ describe("environment loader", () => {
     expect(fallback).toEqual({ secret: "session-secret-0123456789", version: "v1" });
   });
 
-  it("treats an absent or empty trusted proxy secret as not configured", () => {
+  it("treats an absent or empty trusted proxy secret as not configured outside production", () => {
     expect(getTrustedProxySecret({} as unknown as NodeJS.ProcessEnv)).toBeNull();
     expect(
       getTrustedProxySecret({ TRUSTED_PROXY_SECRET: "" } as unknown as NodeJS.ProcessEnv),
@@ -154,7 +155,78 @@ describe("environment loader", () => {
     ).toBe("test-trusted-proxy-secret-0123456789");
   });
 
-  it("rejects a too-short trusted proxy secret", () => {
+  it("requires TRUSTED_PROXY_SECRET in production", () => {
+    resetEnvCache();
+    expect(() =>
+      loadEnv({
+        NODE_ENV: "production",
+        RATE_LIMIT_HMAC_SECRET: "a-sufficiently-long-secret-value",
+        KEY_HMAC_SECRET: "a-sufficiently-long-key-secret-value",
+        SESSION_HMAC_SECRET: "a-sufficiently-long-session-secret-value",
+        HWID_HASH_SECRET: "a-sufficiently-long-hwid-secret-value",
+      } as unknown as NodeJS.ProcessEnv),
+    ).toThrow(/TRUSTED_PROXY_SECRET is required in production/);
+  });
+
+  it("rejects an invalid trusted proxy secret in production", () => {
+    resetEnvCache();
+    expect(() =>
+      loadEnv({
+        NODE_ENV: "production",
+        RATE_LIMIT_HMAC_SECRET: "a-sufficiently-long-secret-value",
+        KEY_HMAC_SECRET: "a-sufficiently-long-key-secret-value",
+        SESSION_HMAC_SECRET: "a-sufficiently-long-session-secret-value",
+        HWID_HASH_SECRET: "a-sufficiently-long-hwid-secret-value",
+        TRUSTED_PROXY_SECRET: "short",
+      } as unknown as NodeJS.ProcessEnv),
+    ).toThrow(/TRUSTED_PROXY_SECRET/);
+  });
+
+  it("accepts a valid trusted proxy secret in production", () => {
+    resetEnvCache();
+    const secret = "a-sufficiently-long-proxy-secret-value";
+    expect(
+      getTrustedProxySecret({
+        NODE_ENV: "production",
+        RATE_LIMIT_HMAC_SECRET: "a-sufficiently-long-secret-value",
+        KEY_HMAC_SECRET: "a-sufficiently-long-key-secret-value",
+        SESSION_HMAC_SECRET: "a-sufficiently-long-session-secret-value",
+        HWID_HASH_SECRET: "a-sufficiently-long-hwid-secret-value",
+        TRUSTED_PROXY_SECRET: secret,
+      } as unknown as NodeJS.ProcessEnv),
+    ).toBe(secret);
+  });
+
+  it("runs without a trusted proxy secret in development and test", () => {
+    resetEnvCache();
+    expect(loadEnv({ NODE_ENV: "development" } as unknown as NodeJS.ProcessEnv).NODE_ENV).toBe(
+      "development",
+    );
+    resetEnvCache();
+    expect(loadEnv({ NODE_ENV: "test" } as unknown as NodeJS.ProcessEnv).NODE_ENV).toBe("test");
+  });
+
+  it("does not echo the trusted proxy secret in a validation error", () => {
+    resetEnvCache();
+    const secret = "leak-check-secret-value";
+    let message = "";
+    try {
+      loadEnv({
+        NODE_ENV: "production",
+        RATE_LIMIT_HMAC_SECRET: "a-sufficiently-long-secret-value",
+        KEY_HMAC_SECRET: "a-sufficiently-long-key-secret-value",
+        SESSION_HMAC_SECRET: "a-sufficiently-long-session-secret-value",
+        HWID_HASH_SECRET: "a-sufficiently-long-hwid-secret-value",
+        TRUSTED_PROXY_SECRET: "short",
+      } as unknown as NodeJS.ProcessEnv);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain("TRUSTED_PROXY_SECRET");
+    expect(message).not.toContain(secret);
+  });
+
+  it("rejects a too-short trusted proxy secret outside production", () => {
     expect(() =>
       loadEnv({ TRUSTED_PROXY_SECRET: "short" } as unknown as NodeJS.ProcessEnv),
     ).toThrow(/TRUSTED_PROXY_SECRET/);
@@ -173,6 +245,7 @@ describe("environment loader", () => {
         RATE_LIMIT_HMAC_SECRET: "a-sufficiently-long-secret-value",
         KEY_HMAC_SECRET: "a-sufficiently-long-key-secret-value",
         SESSION_HMAC_SECRET: "a-sufficiently-long-session-secret-value",
+        TRUSTED_PROXY_SECRET: "a-sufficiently-long-proxy-secret-value",
       } as unknown as NodeJS.ProcessEnv),
     ).toThrow(/HWID_HASH_SECRET is required in production/);
   });

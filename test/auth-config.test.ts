@@ -17,6 +17,7 @@ const production = {
   NODE_ENV: "production",
   RATE_LIMIT_HMAC_SECRET: "test-rate-limit-secret-0123456789",
   KEY_HMAC_SECRET: "test-dedicated-key-secret-0123456789",
+  TRUSTED_PROXY_SECRET: "test-trusted-proxy-secret-0123456789",
 } as unknown as NodeJS.ProcessEnv;
 
 afterEach(() => {

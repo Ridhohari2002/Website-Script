@@ -7,7 +7,7 @@ import {
   toErrorBody,
   unauthorized,
 } from "@/core/errors";
-import { loadEnv } from "@/core/env";
+import { isProduction, loadEnv } from "@/core/env";
 import { logger as rootLogger, type Logger } from "@/core/logger";
 import { resolveRequestId } from "@/core/request-id";
 import { jsonResponse, responseClearsCookie } from "@/core/response";
@@ -40,6 +40,8 @@ export interface ApiDependencies {
   csrfOrigins?: readonly string[];
   /** Durable audit hook for authenticated requests denied by the pipeline. */
   auditDenial?: (event: AuthorizationDenialEvent) => Promise<void> | void;
+  /** Overrides production detection for tests. Defaults to `NODE_ENV`. */
+  production?: boolean;
 }
 
 export function createApiHandler(
@@ -52,6 +54,9 @@ export function createApiHandler(
 
   return async function handle(request, path) {
     const startedAt = Date.now();
+    // Resolved lazily so `next build` page-data collection never needs runtime
+    // secrets. Production fails closed on the first request if they are absent.
+    const production = dependencies.production ?? isProduction();
     const requestId = resolveRequestId(request.headers);
     const requestLogger = logger.child({ requestId });
     const url = new URL(request.url);
@@ -119,7 +124,15 @@ export function createApiHandler(
       }
 
       if (match.route.rateLimit) {
-        const decision = await limiter.consume(match.route.rateLimit(context));
+        const dimensions = match.route.rateLimit(context);
+        // Production must never serve a rate-limited route with no trustworthy
+        // dimension. Without a verified proxy IP (and no session/key dimension),
+        // there is nothing to throttle safely; a shared "unknown" bucket would
+        // let one caller exhaust every other caller's budget. Fail closed.
+        if (production && dimensions.length === 0) {
+          throw forbidden("Trusted proxy required");
+        }
+        const decision = await limiter.consume(dimensions);
         if (!decision.allowed) {
           response = rateLimitedResponse(decision, requestId);
           status = response.status;

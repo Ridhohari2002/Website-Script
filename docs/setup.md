@@ -36,7 +36,7 @@ cp .env.example .env.local
 | `RATE_LIMIT_HMAC_SECRET` | Yes in production | Minimum 16 characters. A development-only default is used otherwise. |
 | `RATE_LIMIT_HMAC_KEY_VERSION` | No | Defaults to `v1`. Increasing it starts a fresh namespace of buckets. |
 | `SESSION_HMAC_SECRET` | Yes in production | Minimum 16 characters. Hashes session tokens and OAuth state, and derives each session's CSRF token. Rotating it revokes every session. |
-| `TRUSTED_PROXY_SECRET` | For trusted client IPs | Minimum 16 characters, server-only. The reverse proxy must strip any client-supplied `x-boyfinity-proxy-secret`, overwrite `x-forwarded-for` with exactly one client address, and inject this value. When unset, no forwarded IP is trusted and IP rate-limit buckets are omitted; see "Rate limiting (D11)". |
+| `TRUSTED_PROXY_SECRET` | Yes in production | Minimum 16 characters, server-only. The reverse proxy must strip any client-supplied `x-boyfinity-proxy-secret`, overwrite `x-forwarded-for` with exactly one client address, and inject this value. Production refuses to start without it. Development and tests may leave it unset; no forwarded IP is then trusted and no shared bucket is created. See "Rate limiting (D11)". |
 | `DISCORD_CLIENT_ID` | For login | Discord application id (snowflake). Any placeholder works for tests; real login needs the real id. |
 | `DISCORD_CLIENT_SECRET` | For login | Server-only. Never commit it, log it, or expose it to browser code. |
 | `DISCORD_REDIRECT_URI` | For login | Must exactly equal `${APP_URL}/api/auth/callback`. |
@@ -267,10 +267,12 @@ decision and is opt-in per route. A fail-closed store failure responds `503`, no
 Client IP buckets only use an address proven by the trusted-proxy marker
 (`x-boyfinity-proxy-secret`). The proxy must remove any client-supplied marker,
 remove or overwrite `x-forwarded-for`, and inject exactly one client address.
-`x-real-ip` is ignored. Without `TRUSTED_PROXY_SECRET`, IP rate limiting is
-**not active**; the deployment must configure the proxy before production, or
-rely only on the per-user, per-key, and per-session buckets. A missing verified
-IP is never collapsed into a shared `unknown` bucket.
+`x-real-ip` is ignored. `TRUSTED_PROXY_SECRET` is **required in production**, so
+the server cannot start with IP trust silently disabled. In production, a
+rate-limited request with no trustworthy dimension is rejected rather than
+served unthrottled; authenticated key routes still carry their server-derived
+user bucket and executor routes still carry per-key or per-session buckets.
+A missing verified IP is never collapsed into a shared `unknown` bucket.
 
 ### Request pipeline hooks
 

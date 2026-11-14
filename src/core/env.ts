@@ -63,8 +63,9 @@ const envSchema = z
     // HWIDs. Required in production; a development-only default is used otherwise.
     HWID_HASH_SECRET: z.string().min(16).optional(),
     // Server-only marker the trusted reverse proxy injects after stripping any
-    // client-supplied value. Optional: when absent, no forwarded IP is trusted
-    // and IP rate limiting is disabled rather than collapsed into one bucket.
+    // client-supplied value. Required in production so the server never runs
+    // with forwarded-IP trust disabled. Development and tests may omit it; when
+    // absent, no forwarded IP is trusted and no shared "unknown" bucket exists.
     TRUSTED_PROXY_SECRET: z.preprocess(
       (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
       z.string().min(16).optional(),
@@ -93,6 +94,15 @@ const envSchema = z
         code: "custom",
         path: ["KEY_HMAC_KEY_VERSION"],
         message: "KEY_HMAC_KEY_VERSION must be v2 when KEY_HMAC_SECRET is set",
+      });
+    }
+    // Production must fail closed without a proxy marker. Otherwise a direct
+    // caller can omit the marker and bypass every IP bucket that depends on it.
+    if (value.NODE_ENV === "production" && !value.TRUSTED_PROXY_SECRET) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["TRUSTED_PROXY_SECRET"],
+        message: "TRUSTED_PROXY_SECRET is required in production",
       });
     }
   });
@@ -213,8 +223,9 @@ export function getHwidSecret(source: NodeJS.ProcessEnv = process.env): string {
 /**
  * Server-only marker expected from the trusted reverse proxy. Returns null when
  * the deployment has not configured one, which means no client IP is trusted.
- * There is deliberately no development default: a public default would let any
- * caller forge the marker.
+ * Production refuses to load without it (see `superRefine`). There is
+ * deliberately no development default: a public default would let any caller
+ * forge the marker.
  */
 export function getTrustedProxySecret(source: NodeJS.ProcessEnv = process.env): string | null {
   return loadEnv(source).TRUSTED_PROXY_SECRET ?? null;
