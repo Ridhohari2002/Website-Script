@@ -33,11 +33,11 @@ export function authRoutes(service: AuthService): RouteDefinition[] {
           windowSeconds: AUTH_WINDOW_SECONDS,
         },
       ],
-      async handler({ request }) {
+      async handler({ request, requestId }) {
         const next = new URL(request.url).searchParams.get("next");
         try {
           const result = await service.startLogin({ next });
-          return redirectResponse(result.location, result.cookies);
+          return redirectResponse(result.location, result.cookies, 302, requestId);
         } catch (error) {
           if (error instanceof AuthError && error.code === "not_configured") {
             throw serviceUnavailable("Authentication is not configured");
@@ -57,7 +57,7 @@ export function authRoutes(service: AuthService): RouteDefinition[] {
           windowSeconds: AUTH_WINDOW_SECONDS,
         },
       ],
-      async handler({ request }) {
+      async handler({ request, requestId }) {
         const url = new URL(request.url);
         const result = await service.completeLogin({
           request,
@@ -65,7 +65,7 @@ export function authRoutes(service: AuthService): RouteDefinition[] {
           state: url.searchParams.get("state"),
           oauthError: url.searchParams.get("error"),
         });
-        return redirectResponse(result.location, result.cookies);
+        return redirectResponse(result.location, result.cookies, 302, requestId);
       },
     },
     {

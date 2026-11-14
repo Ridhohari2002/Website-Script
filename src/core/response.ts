@@ -46,13 +46,18 @@ export function responseClearsCookie(response: Response, name: string): boolean 
 /**
  * Browser redirect helper. Built directly instead of `Response.redirect` so the
  * headers stay mutable for `Set-Cookie` and the response is never cached.
+ *
+ * Browser navigations are API responses too, so the caller passes the request
+ * ID through to keep tracing consistent across JSON and redirect surfaces.
  */
 export function redirectResponse(
   location: string,
   cookies: readonly string[] = [],
   status = 302,
+  requestId?: string,
 ): Response {
   const headers = new Headers({ location, "cache-control": "no-store" });
+  if (requestId) headers.set(REQUEST_ID_HEADER, requestId);
   for (const cookie of cookies) headers.append("set-cookie", cookie);
   return new Response(null, { status, headers });
 }
